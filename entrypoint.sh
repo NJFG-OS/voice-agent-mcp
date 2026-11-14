@@ -5,7 +5,7 @@ set -euo pipefail
 : "${OAUTH2_PROXY_CLIENT_ID:?missing OAUTH2_PROXY_CLIENT_ID}"
 : "${OAUTH2_PROXY_CLIENT_SECRET:?missing OAUTH2_PROXY_CLIENT_SECRET}"
 : "${OAUTH2_PROXY_COOKIE_SECRET:?missing OAUTH2_PROXY_COOKIE_SECRET}"
-: "${PUBLIC_BASE_URL:?missing PUBLIC_BASE_URL (e.g. https://<podId>-3004.proxy.runpod.net)}"
+: "${PUBLIC_BASE_URL:?missing PUBLIC_BASE_URL}"
 
 CFG=/tmp/oauth2-proxy.cfg
 cat > "$CFG" <<CFG
@@ -26,11 +26,14 @@ skip_provider_button = true
 silence_ping_logging = true
 CFG
 
-nohup supergateway \
+echo "Starting supergateway..."
+supergateway \
   --apiKey "$MCP_AUTH_TOKEN" \
-  --stdio "mcp-server-filesystem /workspace" \
+  --stdio "npx -y mcp-server-filesystem /workspace" \
   --outputTransport streamableHttp \
-  --port 3002 --host 0.0.0.0 \
-  > /workspace/mcp-filesystem.log 2>&1 &
+  --port 3002 --host 0.0.0.0 &
 
+sleep 2
+
+echo "Starting oauth2-proxy..."
 exec oauth2-proxy --config "$CFG"
