@@ -1,8 +1,10 @@
 name: publish
+
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -20,6 +22,4 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           push: true
-          tags: ghcr.io/njfg-os/voice-agent-mcp:1.0.0
-        # against the sigstore community Fulcio instance.
-        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+          tags: ghcr.io/njfg-os/voice-agent-mcp:1.0.1
