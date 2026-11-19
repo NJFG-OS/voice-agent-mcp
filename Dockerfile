@@ -27,7 +27,8 @@ COPY requirements.txt /opt/requirements.txt
 RUN pip install --no-cache-dir --ignore-installed PyJWT -r /opt/requirements.txt
 
 RUN git clone --recursive https://github.com/QwenAudio/CosyVoice.git /opt/CosyVoice \
-    && pip install --no-cache-dir -r /opt/CosyVoice/requirements.txt
+    && grep -vE '^grpcio==' /opt/CosyVoice/requirements.txt > /tmp/cosyvoice_reqs.txt \
+    && pip install --no-cache-dir -r /tmp/cosyvoice_reqs.txt
 
 WORKDIR /opt/aether
 COPY start_all.sh /opt/aether/start_all.sh
