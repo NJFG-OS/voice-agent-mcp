@@ -29,4 +29,4 @@ jobs:
           context: .
           file: Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/voice-agent-mcp:0.2.0
+          tags: ghcr.io/njfg-os/voice-agent-mcp:0.2.0
