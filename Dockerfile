@@ -9,12 +9,17 @@ ENV PYTHONUNBUFFERED=1 \
     COSYVOICE_DIR=/opt/CosyVoice \
     WORKSPACE_DIR=/workspace
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      git git-lfs \
-      ffmpeg sox libsox-dev \
-      libsndfile1 \
-      build-essential curl wget unzip \
-    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    sed -i 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true; \
+    for i in 1 2 3; do \
+      apt-get update -o Acquire::Retries=3 && apt-get install -y --no-install-recommends \
+        git git-lfs \
+        ffmpeg \
+        libsndfile1 \
+        build-essential curl wget unzip \
+      && break || { echo "apt retry $i"; sleep 5; }; \
+    done; \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt
 
