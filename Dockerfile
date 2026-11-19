@@ -24,7 +24,7 @@ RUN set -eux; \
 WORKDIR /opt
 
 COPY requirements.txt /opt/requirements.txt
-RUN pip install --no-cache-dir -r /opt/requirements.txt
+RUN pip install --no-cache-dir --ignore-installed PyJWT -r /opt/requirements.txt
 
 RUN git clone --recursive https://github.com/QwenAudio/CosyVoice.git /opt/CosyVoice \
     && pip install --no-cache-dir -r /opt/CosyVoice/requirements.txt
