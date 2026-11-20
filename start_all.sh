@@ -452,6 +452,9 @@ runtime_diagnostics() {
   log "diagnostics: runtime pins: $(tr -d '\n' < "$PINS_FILE" 2>/dev/null || echo missing)"
   log "diagnostics: python: $PY_BIN"
   log "diagnostics: profile: gpu_util=$GPU_UTIL max_model_len=$MAX_MODEL_LEN max_num_seqs=$MAX_NUM_SEQS"
+  # The relay cannot bind 8000 without this, and a missing wheel used to show only as
+  # a restart loop in relay.log. Naming it here makes it a one-line diagnosis.
+  log "diagnostics: aiohttp: $("$PY_BIN" -c 'import aiohttp; print(aiohttp.__version__)' 2>/dev/null || echo MISSING)"
   log "diagnostics: HF_HOME=${HF_HOME}"
   mkdir -p "${HF_HOME}" 2>/dev/null || true
   ls -la "${HF_HOME}" 2>/dev/null | head -n 10 | while IFS= read -r _row; do log "diagnostics: hf-cache: ${_row}"; done
