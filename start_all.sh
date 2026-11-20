@@ -34,7 +34,7 @@ STALL_FILE="${LOG_DIR}/boot_stalled.flag"
 
 # The generation this script IS. /api/pod-code substitutes its served version here,
 # so the pin is compared against the bytes about to run, not a guess.
-SERVED_VERSION="__AETHER_POD_VERSION__"
+SERVED_VERSION="test"
 PINNED_VERSION="${AETHER_POD_VERSION:-}"
 
 # What the image's build-time gate selected. Read for diagnostics only.
@@ -485,7 +485,32 @@ runtime_diagnostics
 # launcher reads. A validated tenant adapter becomes the served model name, so the
 # relay's requests land on that business's LoRA; with nothing approved, the shared
 # base model keeps serving exactly as before.
-ROOT="${AETHER_ROOT:-${WS}/aether}"
+# ---------------------------------------------------------------------------
+# Where the child scripts live. post_start.sh lands the verified generation in its
+# run directory (AETHER_SCRIPT_CACHE, /tmp/aether/run by default) and exports it as
+# AETHER_ROOT. When this supervisor is started any other way - a stale copy left on
+# the volume, a manual background run - that variable is absent, and defaulting to
+# the workspace cache pointed every child at a directory holding only old artifacts: python
+# answered "[Errno 2] No such file or directory: /workspace/aether/voice_relay.py" on
+# every restart. The directory is therefore resolved by finding the scripts, never
+# assumed from a path baked in at build time.
+# ---------------------------------------------------------------------------
+SCRIPT_SENTINEL="voice_relay.py"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+SCRIPT_SEARCH="${AETHER_ROOT:-} ${SCRIPT_DIR:-} ${AETHER_SCRIPT_CACHE:-/tmp/aether/run} /opt/aether ${WS}/aether"
+ROOT=""
+for _candidate in ${AETHER_ROOT:-} "${SCRIPT_DIR:-}" "${AETHER_SCRIPT_CACHE:-/tmp/aether/run}" "/opt/aether" "${WS}/aether"; do
+  [ -n "$_candidate" ] || continue
+  if [ -f "${_candidate}/${SCRIPT_SENTINEL}" ]; then ROOT="$_candidate"; break; fi
+done
+if [ -n "$ROOT" ]; then
+  log "script directory: $ROOT (searched:${SCRIPT_SEARCH})"
+else
+  # Nothing found: keep the old default so the per-script resolution below can still
+  # try, and let it record a named failure instead of an Errno 2 in a child log.
+  ROOT="${AETHER_ROOT:-${WS}/aether}"
+  log "script directory: NONE of${SCRIPT_SEARCH} holds ${SCRIPT_SENTINEL} - falling back to $ROOT"
+fi
 TENANT_ROOT="${AETHER_TENANT_ROOT:-/workspace/tenants}"
 TENANT_ID="${AETHER_TENANT_ID:-}"
 ADAPTER_ALIAS=""
@@ -517,13 +542,32 @@ fi
 # container. The loop is bounded in rate (10s backoff), never in attempts.
 # ---------------------------------------------------------------------------
 run_forever() {
-  local name="$1" script="$2" max_crashes="${3:-0}"
+  local name="$1" script="$2" max_crashes="${3:-5}" path="" _dir
+  # The cap is a number or it is the default. A non-numeric value made the comparison
+  # below [ "" -gt 0 ], which is false forever, so the loop could never stop and a
+  # dead engine was retried until the boot window expired.
+  case "$max_crashes" in ''|*[!0-9]*) max_crashes=5 ;; esac
+  # Resolve THIS script against the verified directory and then the fallbacks. One
+  # directory is never assumed to hold all of them, and a script that is genuinely
+  # absent is named in the failure record instead of reaching python as a bad path.
+  for _dir in "$ROOT" "${AETHER_SCRIPT_CACHE:-/tmp/aether/run}" "/opt/aether" "${WS}/aether"; do
+    [ -n "$_dir" ] || continue
+    if [ -f "${_dir}/${script}" ]; then path="${_dir}/${script}"; break; fi
+  done
+  if [ -z "$path" ]; then
+    log "FATAL: ${script} is not in $ROOT, ${AETHER_SCRIPT_CACHE:-/tmp/aether/run}, /opt/aether or ${WS}/aether"
+    write_fail "script_missing" "${script}_missing" "${script} was not found in any script directory"
+    report boot_failure "script_missing" "${name}"
+    return 1
+  fi
+  [ "$path" = "${ROOT}/${script}" ] || log "${script} resolved from $path (not $ROOT)"
+  log "launching $name: $path (restart cap ${max_crashes} crashes/min)"
   nohup bash -c '
     crashes=0
     while :; do
       began=$(date +%s)
-      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] starting '"$script"'"
-      "'"$PY_BIN"'" "'"$ROOT/$script"'"
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] starting '"$path"'"
+      "'"$PY_BIN"'" "'"$path"'"
       rc=$?
       ran=$(( $(date +%s) - began ))
       echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] '"$script"' exited rc=$rc after ${ran}s"
