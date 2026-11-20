@@ -39,3 +39,5 @@ RUN chmod +x /post_start.sh
 
 VOLUME ["/workspace"]
 EXPOSE 8000 8001 8002 8003 8080
+
+ENTRYPOINT ["/bin/bash", "/opt/aether/start_all.sh"]
