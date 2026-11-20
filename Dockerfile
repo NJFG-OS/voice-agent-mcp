@@ -1,12 +1,17 @@
+# syntax=docker/dockerfile:1
 # =============================================================================
 # AetherVoice — voice-agent-mcp image
-# Builds ON the registry base so the baked Python runtime (torch + vLLM) is kept
-# and only the boot entrypoint is replaced.
+#
+# Builds the NEXT generation on top of the current one, so the baked Python
+# runtime is kept and only the boot entrypoint is replaced.
 #
 #   docker build -t ghcr.io/njfg-os/voice-agent-mcp:0.2.1 .
 #   docker push ghcr.io/njfg-os/voice-agent-mcp:0.2.1
 #
-# What it changes vs the base image
+# Rules this file follows
+#   * BASE_IMAGE is the PREVIOUS generation, never the tag being built. A tag is
+#     never built from itself: that loop rewrites its own base on every push and
+#     the image grows a layer each time.
 #   * /opt/aether/start_all.sh is the container entrypoint (chmod +x, syntax
 #     checked at build time). It never installs a runtime and never fails with
 #     venv_missing — it accepts whatever Python the base image already has.
@@ -17,9 +22,12 @@
 # It does NOT freeze the pod's service code: the entrypoint verifies the app's
 # served POD_VERSION (sha256 manifest) and runs that, so runtime fixes ship
 # without rebuilding this image. The COPY below is the offline fallback only.
+#
+# The image RunPod runs must be the tag the app pins (POD_IMAGE in
+# src/lib/runpod.server.js). Bump both together.
 # =============================================================================
-# syntax=docker/dockerfile:1
-FROM ghcr.io/njfg-os/voice-agent-mcp:0.2.0
+ARG BASE_IMAGE=ghcr.io/njfg-os/voice-agent-mcp:0.2.0
+FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="aether-voice-agent" \
       org.opencontainers.image.description="AetherVoice pod: app-verified boot, baked runtime" \
@@ -44,7 +52,8 @@ ENV AETHER_APP_ORIGIN=https://deft-aether-voice-core.base44.app \
     AETHER_VOICE_DIR=/workspace/tts_voices \
     HF_HOME=/workspace/hf-cache \
     PIP_CACHE_DIR=/workspace/pip-cache \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    AETHER_IMAGE_VERSION=0.2.1
 
 # The entrypoint. Everything else (supervisor, whisper, vLLM launcher, relay,
 # TTS) is fetched and sha256-verified from the app at boot.
