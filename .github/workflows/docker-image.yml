@@ -1,18 +1,32 @@
-# ONE workflow builds the image. It replaces docker-image.yml, docker-publish.yml
-# and publish.yml: those three pushed 0.2.0, 1.0.0 and 1.0.1 from the same
-# Dockerfile, so no build ever produced the tag the app pins.
+# Copy to .github/workflows/docker-image.yml in NJFG-OS/voice-agent-mcp.
 #
-# The tag here must equal the tag the app pins (POD_IMAGE in
-# src/lib/runpod.server.js). Bump both together.
+# ONE workflow builds the image, and it publishes nothing unless the build-time
+# gate passed. It walks the candidate ladder declared in runtime-candidates.json:
+# each base image is tried in order, and inside each build select_runtime_pins.py
+# installs vLLM and requires torch + torch.library.infer_schema + vllm to import.
+# The first combination that passes is pushed under the generation tag AND an
+# immutable sha tag. If every combination fails, this job fails and no image is
+# ever published — the app's pin never points at an unverified runtime.
+#
+# The tag is published_tag in runtime-candidates.json, which must equal the tag the
+# app pins (POD_IMAGE in src/lib/runpod.server.js). One value, three files, bumped
+# together — the run fails early when they disagree.
 name: docker-image
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to publish (empty = published_tag from runtime-candidates.json)
+        required: false
+        default: ""
   push:
     branches: [main]
     paths:
       - Dockerfile
-      - start_all.sh
+      - post_start.sh
+      - runtime-candidates.json
+      - select_runtime_pins.py
       - .github/workflows/docker-image.yml
 
 permissions:
@@ -33,10 +47,47 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          push: true
-          tags: ghcr.io/njfg-os/voice-agent-mcp:0.2.2
+      - name: Build, gate, and publish the first compatible image
+        env:
+          IMAGE: ghcr.io/njfg-os/voice-agent-mcp
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -uo pipefail
+          # The tag CI publishes is the manifest's published_tag, never a second
+          # hardcoded copy: a pin on a tag nothing pushed fails the pull on every pod.
+          MANIFEST_TAG="$(python3 -c 'import json; print(json.load(open("runtime-candidates.json"))["published_tag"])')"
+          if [ -z "${TAG:-}" ]; then TAG="$MANIFEST_TAG"; fi
+          if [ "$TAG" != "$MANIFEST_TAG" ]; then
+            echo "::error::tag $TAG does not match published_tag $MANIFEST_TAG in runtime-candidates.json"
+            exit 1
+          fi
+          echo "publishing $IMAGE:$TAG"
+          SHA_TAG="sha-$(printf '%s' "$GITHUB_SHA" | cut -c1-12)"
+
+          # The ladder, in declared order. A base that cannot even be pulled is a
+          # failed candidate, not the end of the run.
+          mapfile -t BASES < <(python3 -c 'import json; [print(row["image"]) for row in json.load(open("runtime-candidates.json"))["bases"]]')
+          if [ "${#BASES[@]}" -eq 0 ]; then
+            echo "runtime-candidates.json declares no base images" >&2
+            exit 1
+          fi
+
+          for base in "${BASES[@]}"; do
+            echo "::group::candidate $base"
+            if docker build \
+                 --build-arg BASE_IMAGE="$base" \
+                 --tag "$IMAGE:$TAG" \
+                 --tag "$IMAGE:$SHA_TAG" \
+                 .; then
+              docker push "$IMAGE:$TAG"
+              docker push "$IMAGE:$SHA_TAG"
+              echo "::endgroup::"
+              echo "published $IMAGE:$TAG (and $SHA_TAG) from $base"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "candidate $base failed the build gate — trying the next one"
+          done
+
+          echo "No candidate passed the build-time import gate. Nothing was published." >&2
+          exit 1
