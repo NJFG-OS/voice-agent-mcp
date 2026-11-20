@@ -3,7 +3,8 @@
 # ONE workflow builds the image, and it publishes nothing unless the build-time
 # gate passed. It walks the candidate ladder declared in runtime-candidates.json:
 # each base image is tried in order, and inside each build select_runtime_pins.py
-# installs vLLM and requires torch + torch.library.infer_schema + vllm to import.
+# installs vLLM and requires torch + vllm + vllm._C to import (no private torch
+# symbol: torch.library does not export infer_schema in torch 2.4.x).
 # The first combination that passes is pushed under the generation tag AND an
 # immutable sha tag. If every combination fails, this job fails and no image is
 # ever published — the app's pin never points at an unverified runtime.
@@ -32,6 +33,13 @@ on:
 permissions:
   contents: read
   packages: write
+
+# One build at a time per ref. Two pushes in a row used to start two builds that
+# raced to publish the same tag, so the image could be replaced mid-pull; the newer
+# commit now cancels the older run instead.
+concurrency:
+  group: docker-image-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
