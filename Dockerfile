@@ -84,11 +84,32 @@ COPY runtime-candidates.json /opt/aether/runtime-candidates.json
 COPY select_runtime_pins.py /opt/aether/select_runtime_pins.py
 
 # THE BUILD GATE. Tries the declared vLLM ladder in order, installs the candidate,
-# and requires torch + torch.library.infer_schema + vllm + vllm._C to import. It
+# and requires torch + vllm + vllm._C to import. It
 # then installs and import-gates faster-whisper and one TTS engine. The selected
 # pins are written to /opt/aether/runtime-pins.json for the pod's own diagnostics.
 # No candidate passing = this step fails = no image, no publish.
-RUN python3 /opt/aether/select_runtime_pins.py \
+# THE CUDA DRIVER STUB — scoped to the gate steps below, never to the image.
+# A docker build has no GPU and no NVIDIA driver, so libcuda.so.1 does not exist and
+# `import vllm._C` fails with "libcuda.so.1: cannot open shared object file" before
+# any wheel can be judged. The CUDA devel base ships the driver stub the toolkit
+# itself uses for exactly this: resolving the driver API with no driver present.
+# It is exposed ONLY through LD_LIBRARY_PATH inside the two gate RUN steps, so it is
+# never added to the image's default linker path: at runtime the real driver mounted
+# by the NVIDIA container runtime always wins.
+RUN set -eu; \
+    mkdir -p /opt/aether/cuda-stub; \
+    stub=""; \
+    for c in /usr/local/cuda/lib64/stubs/libcuda.so \
+             /usr/local/cuda/lib64/stubs/libcuda.so.1 \
+             /usr/local/cuda/compat/libcuda.so.1; do \
+      if [ -e "$c" ]; then stub="$c"; break; fi; \
+    done; \
+    if [ -z "$stub" ]; then echo "the base image ships no CUDA driver stub (libcuda.so)" >&2; exit 1; fi; \
+    ln -sf "$stub" /opt/aether/cuda-stub/libcuda.so.1; \
+    ls -l /opt/aether/cuda-stub/libcuda.so.1
+
+RUN export LD_LIBRARY_PATH="/opt/aether/cuda-stub:${LD_LIBRARY_PATH:-}" \
+    && python3 /opt/aether/select_runtime_pins.py \
       --manifest /opt/aether/runtime-candidates.json \
       --base "${BASE_IMAGE}" \
       --out /opt/aether/runtime-pins.json \
@@ -97,7 +118,8 @@ RUN python3 /opt/aether/select_runtime_pins.py \
 
 # The same three imports the pod's health contract depends on, proven once more from
 # the finished image so a later layer can never shadow them.
-RUN python3 -c "import torch, vllm, faster_whisper; print('brain+ear ok', torch.__version__, vllm.__version__)" \
+RUN export LD_LIBRARY_PATH="/opt/aether/cuda-stub:${LD_LIBRARY_PATH:-}" \
+    && python3 -c "import torch, vllm, faster_whisper; print('brain+ear ok', torch.__version__, vllm.__version__)" \
     && python3 -c "import importlib, json; pins=json.load(open('/opt/aether/runtime-pins.json')); importlib.import_module(pins['tts_module']); print('mouth ok', pins['tts'])"
 
 # The app stack. /start.sh (the base image's entrypoint) runs this after sshd and
