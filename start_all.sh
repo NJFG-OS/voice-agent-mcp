@@ -1,355 +1,634 @@
-#!/usr/bin/env bash
-# =============================================================================
-# AetherVoice — baked container entrypoint  (/opt/aether/start_all.sh)
-# Baked into: ghcr.io/njfg-os/voice-agent-mcp:0.2.2
+#!/bin/bash
+# AetherVoice start_all.sh - the image's own runtime, deterministic generation.
 #
-# What this file is
-#   The image's ONE entrypoint — the boot-contract bootstrapper. It never
-#   installs a runtime, never blocks on venv_missing, and never writes a startup
-#   script into /workspace. It:
-#     1. picks a Python that already carries torch (baked venv, /opt/venv, conda,
-#        /usr/local, /usr/bin, PATH) and records why each candidate lost
-#     2. asks the app for the served generation and its sha256 MANIFEST
-#        (/api/pod-code?name=manifest) — the manifest is the authority, this
-#        image never computes its own idea of what the tree should be
-#     3. reuses the verified cache when the generation and every digest agree,
-#        otherwise fetches the served files, syntax-checks each one and proves
-#        its sha256 against the manifest before landing it
-#     4. hands off with `exec` to the verified served supervisor, so a runtime
-#        fix ships from the app with no image rebuild
+# Run by /post_start.sh (which the image's /start.sh runs once SSH and Jupyter are
+# up), from the sha256-verified served tree on the container disk.
 #
-# Storage contract
-#   container disk   /opt/aether (this file)   /tmp/aether/run (verified cache)
-#                    /tmp (probe + boot-failure records)
-#   /workspace       hf-cache, pip-cache, tts_voices, aether/logs — model caches
-#                    and voices only; NO startup script is ever required there
-#
-# The served supervisor owns preflight, the vLLM overlay, the staged service
-# gates and the ready report. The generation pin (AETHER_POD_VERSION vs the
-# served VERSION) is enforced there, on the bytes that are about to run.
-#
-# Webhook secret: WEBHOOK_SECRET or AETHER_WEBHOOK_SECRET, whichever is set.
-# =============================================================================
+# /workspace is persistent storage ONLY: HF cache, voices, logs. No executables, no
+# venv, no chmod that can fail a boot. vLLM is baked into the image.
 set -uo pipefail
 
-APP="${AETHER_APP_ORIGIN:-******}"
-APP="${APP%/}"
-BAKED_ROOT="/opt/aether"
-CACHE_DIR="${AETHER_SCRIPT_CACHE:-/tmp/aether/run}"
-OFFLINE_ROOT="${AETHER_BAKED_SUPERVISOR_DIR:-${BAKED_ROOT}/pod}"
-WORKSPACE_DIR="${AETHER_WORKSPACE_DIR:-/workspace}"
+WS="${AETHER_WORKSPACE_DIR:-/workspace}"
+
+# Logs first: a boot that fails before this point has nowhere to explain itself.
+# No chmod - the directory may be owned by another uid and chmod would only add
+# a failing command to the boot.
+LOG_DIR="${WS}/aether/logs"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+if [ ! -w "$LOG_DIR" ]; then
+  LOG_DIR=/tmp/aether-logs
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+fi
+
+SUPERVISOR_LOG="${LOG_DIR}/supervisor.log"
+DIAG="${LOG_DIR}/boot_diag.log"
+FAIL_FILE="${LOG_DIR}/boot_failed.json"
+LEGACY_FAIL_FILE="${LOG_DIR}/boot_fail.json"
+RUNTIME_PROBE_FILE="${LOG_DIR}/runtime-probe.txt"
+
+# The generation this script IS. /api/pod-code substitutes its served version here,
+# so the pin is compared against the bytes about to run, not a guess.
+SERVED_VERSION="__AETHER_POD_VERSION__"
+PINNED_VERSION="${AETHER_POD_VERSION:-}"
+
+# What the image's build-time gate selected. Read for diagnostics only.
+PINS_FILE="${AETHER_RUNTIME_PINS:-/opt/aether/runtime-pins.json}"
+GPU_UTIL="${AETHER_GPU_MEMORY_UTILIZATION:-0.65}"
+MAX_MODEL_LEN="${AETHER_MAX_MODEL_LEN_24:-4096}"
+MAX_NUM_SEQS="${AETHER_MAX_NUM_SEQS_24:-4}"
+
+RELAY_PORT=8000
+WHISPER_PORT=8001
+VLLM_PORT=8002
+TTS_PORT=8080
+
+BOOT_WINDOW="${AETHER_BOOT_WINDOW:-900}"
+WHISPER_TIMEOUT="${AETHER_WHISPER_BOOT_TIMEOUT:-420}"
+# Weights download on a cold cache: the window has to cover ~16GB over fuse.ge.
+VLLM_TIMEOUT="${AETHER_VLLM_BOOT_TIMEOUT:-${AETHER_BOOT_WINDOW:-1800}}"
+# A short note only: the worker answers its port immediately and its /health turns
+# 200 once a real synthesis succeeds, which is what the relay gates on. Waiting the
+# full warm-up here would delay the relay for no benefit.
+TTS_TIMEOUT="${AETHER_TTS_BOOT_TIMEOUT:-60}"
+RELAY_TIMEOUT="${AETHER_RELAY_BOOT_TIMEOUT:-180}"
+MIN_VRAM_MB="${AETHER_MIN_VRAM_MB:-23000}"
+
+# The served model: the first preference the app sent, else the explicit model.
+MODEL="${AETHER_VLLM_MODEL:-}"
+if [ -z "$MODEL" ] && [ -n "${AETHER_VLLM_MODEL_PREFS:-}" ]; then
+  MODEL="$(printf '%s' "${AETHER_VLLM_MODEL_PREFS}" | cut -d, -f1 | tr -d ' ')"
+fi
+[ -n "$MODEL" ] || MODEL="meta-llama/Llama-3.1-8B-Instruct"
+
+GPU_NAME=""
+VRAM_GB=0
+VRAM_MB=0
+PY_BIN="${AETHER_PYTHON:-}"
+
+APP="${AETHER_APP_ORIGIN:-}"
+POD="${RUNPOD_POD_ID:-}"
+WS_ID="${AETHER_WORKSPACE_ID:-}"
+NODE_ID="${AETHER_NODE_ID:-}"
 SECRET="${WEBHOOK_SECRET:-${AETHER_WEBHOOK_SECRET:-}}"
-BOOTSTRAP_ONLY="${AETHER_BOOTSTRAP_ONLY:-0}"
-PROBE_FILE="/tmp/aether-runtime-probe.txt"
-FAIL_FILE="/tmp/aether-boot-fail.json"
-MANIFEST_FILE="${CACHE_DIR}/.served-manifest.json"
 
-export AETHER_APP_ORIGIN="$APP"
-export AETHER_WORKSPACE_DIR="$WORKSPACE_DIR"
-export AETHER_BOOTSTRAP_ONLY="$BOOTSTRAP_ONLY"
-export HF_HOME="${HF_HOME:-${WORKSPACE_DIR}/hf-cache}"
-export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${WORKSPACE_DIR}/pip-cache}"
-export AETHER_VOICE_DIR="${AETHER_VOICE_DIR:-${WORKSPACE_DIR}/tts_voices}"
+export HF_HOME="${HF_HOME:-${WS}/hf-cache}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${WS}/pip-cache}"
 export PYTHONUNBUFFERED=1
-# Both aliases always carry the same value, whichever one the template set.
-export WEBHOOK_SECRET="$SECRET"
-export AETHER_WEBHOOK_SECRET="$SECRET"
+export AETHER_VLLM_URL="http://127.0.0.1:${VLLM_PORT}"
+export AETHER_TTS_URL="http://127.0.0.1:${TTS_PORT}"
+export AETHER_WHISPER_URL="http://127.0.0.1:${WHISPER_PORT}"
+export AETHER_VLLM_MODEL="${MODEL}"
+export AETHER_VLLM_PORT="${VLLM_PORT}"
+export AETHER_WHISPER_PORT="${WHISPER_PORT}"
+export AETHER_SERVED_MODEL="${MODEL}"
+export AETHER_LOG_DIR="${LOG_DIR}"
+export AETHER_GPU_MEMORY_UTILIZATION="${GPU_UTIL}"
+export AETHER_MAX_MODEL_LEN_24="${MAX_MODEL_LEN}"
+export AETHER_MAX_NUM_SEQS_24="${MAX_NUM_SEQS}"
+export AETHER_RUNTIME_PINS="${PINS_FILE}"
 
-log() { printf 'AetherVoice[boot]: %s\n' "$*" >&2; }
-log "entrypoint /opt/aether/start_all.sh pid=$$"
+# One log for the whole boot, mirrored into boot_diag.log for the diagnostics panel.
+log() {
+  local line="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
+  printf '%s\n' "$line" >> "$SUPERVISOR_LOG" 2>/dev/null || printf '%s\n' "$line"
+  printf '%s\n' "$line" >> "$DIAG" 2>/dev/null || true
+}
 
-# -----------------------------------------------------------------------------
-# Boot-failure record: one JSON, stamped with an aware UTC datetime (never
-# utcnow()), written to the container disk and posted to the app when reachable.
-# -----------------------------------------------------------------------------
-fail_report() {
-  local reason="$1" detail="${2:-}" body="" code=""
-  if command -v "${PY:-python3}" >/dev/null 2>&1; then
-    body=$("${PY:-python3}" - "$reason" "$detail" "${RUNPOD_POD_ID:-}" \
-      "${AETHER_WORKSPACE_ID:-}" "${AETHER_NODE_ID:-}" "${WANT:-}" <<'PYJSON'
-import datetime, json, sys
-reason, detail, pod, ws, node, want = sys.argv[1:7]
-print(json.dumps({
-    "probe": "boot_failure",
-    "stage": "entrypoint",
+hold() {
+  log "container held open for inspection: $1"
+  sleep infinity
+}
+
+# ---------------------------------------------------------------------------
+# Stale Aether workers. Ownership is decided by the process's OWN COMMAND LINE,
+# never by a port number: killing whatever listens on 8000-8080 could take down a
+# listener that is not ours. A process is ours only when its command line names one
+# of this pod's roots AND one of its served scripts, and it is never this script.
+# ---------------------------------------------------------------------------
+owned_worker_pids() {
+  local dir pid cmd marker
+  [ -d /proc ] || return 0
+  for dir in /proc/[0-9]*; do
+    pid="${dir#/proc/}"
+    [ "$pid" = "$$" ] && continue
+    cmd="$(tr '\0' ' ' < "$dir/cmdline" 2>/dev/null || true)"
+    [ -n "$cmd" ] || continue
+    # The engine is this image's own: nothing else in the pod runs vLLM.
+    case "$cmd" in
+      *vllm.entrypoints.openai.api_server*) printf '%s\n' "$pid"; continue ;;
+    esac
+    # Every other worker is ours only by SCRIPT NAME...
+    case "$cmd" in
+      *voice_relay.py*|*tts_server.py*|*whisper_server.py*|*run_vllm_safe.py*|*train_lora.py*) ;;
+      *) continue ;;
+    esac
+    # ...AND when it also names one of this pod's own roots. An unset root is skipped,
+    # never turned into a wildcard that would match every process on the box.
+    for marker in "${AETHER_ROOT:-}" "${AETHER_SCRIPT_CACHE:-/tmp/aether/run}" "/opt/aether" "/tmp/aether" "${WS}/aether"; do
+      [ -n "$marker" ] || continue
+      case "$cmd" in
+        *"$marker"*) printf '%s\n' "$pid"; break ;;
+      esac
+    done
+  done
+}
+
+clear_stale_workers() {
+  local pids pid
+  pids="$(owned_worker_pids)"
+  [ -n "$pids" ] || return 0
+  # TERM first, so a launcher forwards it to its vLLM child instead of orphaning it
+  # on the GPU; KILL only for whatever ignored it.
+  for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
+  sleep 2
+  for pid in $pids; do
+    kill -0 "$pid" 2>/dev/null || continue
+    kill -9 "$pid" 2>/dev/null || true
+  done
+}
+clear_stale_workers
+log "stale Aether workers cleared (ownership by command line, never by port)"
+
+# Every boot starts its service logs empty. The logs live on the persistent volume,
+# so without this a failure's tail mixes generations - an old vLLM traceback reads
+# as this boot's crash and sends the diagnosis down the wrong path.
+for _svc in whisper vllm tts relay runtime supervisor watchdog; do : > "${LOG_DIR}/${_svc}.log" 2>/dev/null || true; done
+rm -f "$FAIL_FILE" "$LEGACY_FAIL_FILE" 2>/dev/null || true
+: > "$DIAG" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# The failure record. boot_failed.json is the machine-readable one the app and an
+# operator read; boot_fail.json is kept because existing tooling already reads it.
+# Both carry the vLLM tail, which is the answer in almost every case.
+# ---------------------------------------------------------------------------
+write_fail() {
+  local stage="$1" reason="$2" detail="${3:-}" py
+  py="${PY_BIN:-}"
+  [ -n "$py" ] || py="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+  [ -n "$py" ] || return 0
+  "$py" - "$FAIL_FILE" "$LEGACY_FAIL_FILE" "$stage" "$reason" "$detail" "$LOG_DIR" "$MODEL" "$POD" "$SERVED_VERSION" <<'PY'
+import datetime, json, os, sys
+path, legacy, stage, reason, detail, log_dir, model, pod, version = sys.argv[1:10]
+
+
+def tail(name, lines):
+    try:
+        with open(os.path.join(log_dir, name + ".log"), errors="replace") as handle:
+            return handle.read().splitlines()[-lines:]
+    except Exception:
+        return []
+
+
+data = {
+    "stage": stage,
     "reason": reason,
-    "detail": detail[:1500],
+    "detail": detail[:4000],
+    "pod_version": version,
+    "model": model,
     "pod_id": pod,
-    "workspace_id": ws,
-    "node_id": node,
-    "served_version": want,
+    "log_dir": log_dir,
+    "vllm_log_tail": tail("vllm", 200),
+    "supervisor_log_tail": tail("supervisor", 120),
     "ts": datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
-}))
-PYJSON
-)
-  fi
-  [ -n "$body" ] && printf '%s\n' "$body" > "$FAIL_FILE" 2>/dev/null
-  log "BOOT FAILED reason=$reason ${detail:+detail=$detail}"
-  if [ -n "$body" ] && [ -n "$SECRET" ]; then
-    code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -X POST "$APP/api/runpod-webhook" \
-      -H 'content-type: application/json' -H "x-webhook-secret: $SECRET" \
-      --data-binary "$body" 2>/dev/null || true)
-    log "failure report http=${code:-none}"
-  fi
+}
+for target in (path, legacy):
+    try:
+        with open(target, "w") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+    except Exception:
+        pass
+print(json.dumps({"stage": stage, "reason": reason, "pod_id": pod}))
+PY
 }
 
-# -----------------------------------------------------------------------------
-# 1. Python runtime — accepted, never demanded.
-#    Every interpreter the image could ship is probed for torch. The first one
-#    that passes is used; vLLM itself arrives as the app-managed --no-deps
-#    overlay on the container disk, so an interpreter without it is still a
-#    usable runtime. If nothing passes we continue on the best available
-#    python3: the services report their own health, and a missing wheel is not a
-#    reason to refuse to boot a paid GPU pod.
-# -----------------------------------------------------------------------------
-runtime_candidates() {
-  {
-    printf '%s\n' "${AETHER_PYTHON:-}"
-    printf '%s\n' "${BAKED_ROOT}/venv/bin/python" "${BAKED_ROOT}/venv/bin/python3"
-    printf '%s\n' /opt/venv/bin/python /opt/venv/bin/python3
-    printf '%s\n' /opt/conda/bin/python /opt/conda/bin/python3 /opt/miniconda3/bin/python
-    printf '%s\n' /usr/local/bin/python3 /usr/local/bin/python
-    printf '%s\n' /usr/bin/python3 /usr/bin/python
-    command -v python3 2>/dev/null || true
-    command -v python 2>/dev/null || true
-  } | awk 'NF && !seen[$0]++'
-}
-
-select_python() {
-  local py
-  : > "$PROBE_FILE" 2>/dev/null || true
-  while IFS= read -r py; do
-    [ -n "$py" ] || continue
-    if [ ! -x "$py" ]; then
-      printf '%s=absent ' "$py" >> "$PROBE_FILE" 2>/dev/null
-      continue
-    fi
-    if ! "$py" -c 'import torch' >/dev/null 2>&1; then
-      printf '%s=no_torch ' "$py" >> "$PROBE_FILE" 2>/dev/null
-      continue
-    fi
-    printf '%s=ok ' "$py" >> "$PROBE_FILE" 2>/dev/null
-    printf '%s' "$py"
+# ---------------------------------------------------------------------------
+# Reporting. A "ready" report is what binds the pod's tunnel in the app; a
+# "boot_failure" report records the stage and the log tail. Neither stops the pod.
+# Bodies are built by python3, so no JSON ever passes through shell quoting.
+# ---------------------------------------------------------------------------
+report() {
+  local kind="$1" reason="${2:-}" stage="${3:-}" body code
+  if [ -z "$APP" ] || [ -z "$SECRET" ]; then
+    log "$kind report skipped - AETHER_APP_ORIGIN or WEBHOOK_SECRET is unset"
     return 0
-  done <<EOF
-$(runtime_candidates)
-EOF
+  fi
+  body=$(python3 - "$kind" "$POD" "$WS_ID" "$NODE_ID" "$reason" "$stage" "${AETHER_SERVED_MODEL:-}" "$GPU_NAME" "$VRAM_GB" <<'PY'
+import datetime, json, os, sys
+kind, pod, ws, node, reason, stage, served, gpu, vram = sys.argv[1:10]
+if kind == "ready":
+    print(json.dumps({
+        "pod_id": pod, "workspace_id": ws, "node_id": node,
+        "status": "ready", "port": 8000,
+        "ports": {"8000": "relay", "8001": "whisper", "8002": "vllm", "8080": "tts"},
+        "mount_ok": True, "gpu_ok": True,
+        "whisper_ok": True, "vllm_ok": True, "tts_ok": True, "relay_ok": True,
+        "gpu_name": gpu, "vram_gb": vram, "served_model": served,
+        "tunnel_url": "https://%s-8000.proxy.runpod.net" % pod,
+    }))
+else:
+    tail = []
+    log_dir = os.environ.get("AETHER_LOG_DIR", "")
+    for name in ("boot_diag", "supervisor", "runtime", "whisper", "vllm", "tts", "relay"):
+        try:
+            rows = open(os.path.join(log_dir, name + ".log"), errors="replace").read().splitlines()[-40:]
+        except Exception:
+            rows = []
+        for row in rows:
+            if not any(mark in row for mark in ("HF_TOKEN", "WEBHOOK_SECRET", "Authorization", "hf_", "sk-")):
+                tail.append(name + ": " + row)
+    print(json.dumps({
+        "probe": "boot_failure", "stage": stage, "pod_id": pod,
+        "workspace_id": ws, "node_id": node, "error": reason,
+        "gpu_name": gpu, "vram_gb": vram, "served_model": served,
+        "log_tail": "\n".join(tail)[-4000:],
+        "diagnostic_mode": True,
+        "ts": datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
+    }))
+PY
+)
+  code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -X POST "$APP/api/runpod-webhook" \
+    -H 'content-type: application/json' -H "x-webhook-secret: $SECRET" --data-binary "$body" || true)
+  log "$kind report http=$code${reason:+ reason=$reason}"
+}
+
+# A gate that fails: record it, tell the app, and hold. Never exit.
+gate_fail() {
+  local stage="$1" reason="$2" detail="${3:-}"
+  log "BOOT PROBLEM stage=$stage reason=$reason"
+  write_fail "$stage" "$reason" "$detail" >> "$DIAG" 2>&1 || true
+  report boot_failure "$reason" "$stage"
+  hold "$stage: $reason"
+}
+
+# ---------------------------------------------------------------------------
+# THE MOUNT GATE. /workspace is persistent storage: without it the pod would write
+# a generation into a disk that disappears with it.
+# ---------------------------------------------------------------------------
+MOUNT_OK=1
+if command -v mountpoint >/dev/null 2>&1; then
+  mountpoint -q "$WS" || MOUNT_OK=0
+else
+  grep -qs " $WS " /proc/mounts || MOUNT_OK=0
+fi
+if [ "$MOUNT_OK" != "1" ]; then
+  log "mount gate: $WS is NOT the persistent volume"
+  ls -la "$WS" >> "$DIAG" 2>&1 || true
+  gate_fail mount workspace_not_mounted "$WS is not a mount point"
+fi
+log "mount gate: $WS is the persistent volume"
+log "logs: $LOG_DIR (no chmod)"
+
+# ---------------------------------------------------------------------------
+# THE VERSION GATE. The pod runs the generation it was pinned to, or it does not
+# run at all: a half-shipped generation is how a stale script kept serving.
+# ---------------------------------------------------------------------------
+version_gate() {
+  local served
+  log "version gate: script=$SERVED_VERSION pinned=${PINNED_VERSION:-unset}"
+  if [ -z "$PINNED_VERSION" ]; then
+    log "version gate: AETHER_POD_VERSION is unset - running $SERVED_VERSION unpinned (set the pin on the template)"
+    return 0
+  fi
+  if [ "$PINNED_VERSION" != "$SERVED_VERSION" ]; then
+    # A RunPod restart retains its creation-time env. Accept a new generation ONLY
+    # when the baked entrypoint verified the complete manifest on container disk.
+    if [ "${AETHER_SELF_REFRESHED:-0}" = "1" ] && "${PY_BIN:-python3}" - "${AETHER_ROOT:-}" "$SERVED_VERSION" <<'PYVERIFY'
+import hashlib, json, pathlib, sys
+root, version = pathlib.Path(sys.argv[1]), sys.argv[2]
+manifest = json.loads((root / ".boot-manifest.json").read_text())
+files = manifest.get("files") or []
+assert manifest.get("pod_version") == version and files
+assert any(row["name"] == "start_all.sh" for row in files)
+for row in files:
+    if row["name"] == "VERSION":
+        continue
+    assert pathlib.Path(row["name"]).name == row["name"]
+    assert hashlib.sha256((root / row["name"]).read_bytes()).hexdigest() == row["sha256"]
+PYVERIFY
+    then
+      log "version gate: verified restart upgrade $PINNED_VERSION -> $SERVED_VERSION"
+      PINNED_VERSION="$SERVED_VERSION"
+      export AETHER_POD_VERSION="$SERVED_VERSION"
+    else
+      gate_fail version version_mismatch "pod pinned $PINNED_VERSION but no verified $SERVED_VERSION tree exists"
+    fi
+  fi
+  if [ -n "$APP" ]; then
+    served=$(curl -sS -m 10 "$APP/api/pod-code?name=VERSION" 2>/dev/null | tr -d '[:space:]' || true)
+    if [ -n "$served" ] && [ "$served" != "$PINNED_VERSION" ]; then
+      gate_fail version version_mismatch "pod pinned $PINNED_VERSION but the app serves $served"
+    fi
+    log "version gate: manifest=${served:-unreachable} pin=$PINNED_VERSION"
+  fi
+  log "version gate: ok"
+}
+version_gate
+
+# ---------------------------------------------------------------------------
+# Preflight - diagnostics only, never an exit.
+# ---------------------------------------------------------------------------
+preflight() {
+  local missing="" free_gb raw
+
+  for _var in AETHER_APP_ORIGIN WEBHOOK_SECRET AETHER_WORKSPACE_ID AETHER_NODE_ID; do
+    case "$_var" in
+      WEBHOOK_SECRET) [ -n "${WEBHOOK_SECRET:-${AETHER_WEBHOOK_SECRET:-}}" ] || missing="$missing $_var" ;;
+      *) eval "_v=\${$_var:-}"; [ -n "$_v" ] || missing="$missing $_var" ;;
+    esac
+  done
+  [ -z "$missing" ] || log "preflight: missing env:${missing} - reports will be limited"
+
+  if printf 'ok' > "${WS}/aether/.write-test" 2>/dev/null; then
+    rm -f "${WS}/aether/.write-test" 2>/dev/null || true
+    log "preflight: $WS/aether writable"
+  else
+    log "preflight: $WS/aether is NOT writable"
+  fi
+
+  free_gb=$(df -Pm "${WS}" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024}')
+  log "preflight: free disk ${free_gb:-unknown}GB on ${WS}"
+
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    log "preflight: nvidia-smi is not on PATH - no GPU visible"
+    return 0
+  fi
+  if ! nvidia-smi >/dev/null 2>&1; then
+    log "preflight: nvidia-smi failed - no usable CUDA GPU"
+    return 0
+  fi
+
+  GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 | tr -d '\r')
+  # MiB, never whole GB: a 24GB card reports 24564 MiB and rounding that to 23GB
+  # rejected an RTX 4090. The driver can still be initialising, so the read retries.
+  for _try in 1 2 3 4 5 6 7 8 9 10; do
+    raw=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -dc '0-9')
+    VRAM_MB=${raw:-0}
+    [ "${VRAM_MB:-0}" -gt 0 ] && break
+    sleep 2
+  done
+  VRAM_GB=$(( (VRAM_MB + 1023) / 1024 ))
+  log "preflight: GPU=${GPU_NAME:-unknown} VRAM=${VRAM_MB}MiB (${VRAM_GB}GB) floor=${MIN_VRAM_MB}MiB"
+  if [ "${VRAM_MB:-0}" -lt "$MIN_VRAM_MB" ]; then
+    log "preflight: GPU is below the ${MIN_VRAM_MB}MiB floor - vLLM will refuse to start (see vllm.log)"
+  fi
+}
+preflight
+
+# ---------------------------------------------------------------------------
+# THE RUNTIME: the image's own python. Nothing is installed into it here - a
+# runtime torch install is what pulled a CUDA stack and broke every boot.
+# ---------------------------------------------------------------------------
+runtime_gate() {
+  [ -n "$PY_BIN" ] || PY_BIN="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+  [ -n "$PY_BIN" ] || gate_fail runtime no_python_interpreter "no python3 on PATH"
+  [ -x "$PY_BIN" ] || gate_fail runtime python_not_executable "$PY_BIN is not executable"
+  log "runtime: $PY_BIN ($("$PY_BIN" -c 'import sys; print(sys.version.split()[0])' 2>/dev/null || echo unknown))"
+  log "runtime: torch $("$PY_BIN" -c 'import torch; print(torch.__version__)' 2>/dev/null || echo unavailable)"
+}
+runtime_gate
+
+# ---------------------------------------------------------------------------
+# THE RUNTIME GATE. vLLM was installed at IMAGE BUILD time and only after the same
+# imports below passed, so this asserts the running interpreter rather than
+# installing anything. vllm._C is the compiled extension: importing it proves the
+# wheel matches this image's torch and CUDA stack. No private torch symbol is
+# asserted — requiring one that torch 2.4.x does not export is what reported
+# vllm_import_failed on healthy boots.
+# ---------------------------------------------------------------------------
+verify_vllm_runtime() {
+  local gate rc
+  if [ -s "$PINS_FILE" ]; then
+    log "runtime pins: $(tr -d '\n' < "$PINS_FILE" 2>/dev/null)"
+  else
+    log "runtime pins: $PINS_FILE is missing — this image was built without the gate"
+  fi
+  gate=$("$PY_BIN" - <<'PYGATE' 2>&1
+import torch
+import vllm
+import vllm._C
+print("torch", torch.__version__, "vllm", vllm.__version__)
+PYGATE
+)
+  rc=$?
+  printf '%s\n' "$gate" >> "${LOG_DIR}/runtime.log" 2>/dev/null || true
+  if [ "$rc" -eq 0 ]; then
+    log "runtime gate: $gate"
+    log "runtime gate: vllm + vllm._C present — the image's vLLM is the one this pod runs"
+    return 0
+  fi
+  printf '%s\n' "$gate" | tail -n 40 >> "$SUPERVISOR_LOG" 2>/dev/null || true
+  gate_fail vllm vllm_import_failed "$(printf '%s' "$gate" | tail -n 20)"
+}
+verify_vllm_runtime
+
+# ---------------------------------------------------------------------------
+# Pre-vLLM diagnostics: the GPU, the runtime versions actually importable, the
+# cache the weights land in and whether Hugging Face will serve this repo. The
+# token itself is never printed - only whether one is set.
+# ---------------------------------------------------------------------------
+runtime_diagnostics() {
+  local first code token_state
+  log "diagnostics: ---- pre-vLLM ----"
+  first=$(nvidia-smi 2>/dev/null | head -n1 | tr -d '\r' | cut -c1-240)
+  log "diagnostics: nvidia-smi: ${first:-unavailable}"
+  log "diagnostics: torch: $("$PY_BIN" -c 'import torch; print(torch.__version__, torch.version.cuda)' 2>/dev/null || echo unavailable)"
+  log "diagnostics: vllm: $("$PY_BIN" -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo unavailable)"
+  log "diagnostics: runtime pins: $(tr -d '\n' < "$PINS_FILE" 2>/dev/null || echo missing)"
+  log "diagnostics: python: $PY_BIN"
+  log "diagnostics: profile: gpu_util=$GPU_UTIL max_model_len=$MAX_MODEL_LEN max_num_seqs=$MAX_NUM_SEQS"
+  log "diagnostics: HF_HOME=${HF_HOME}"
+  mkdir -p "${HF_HOME}" 2>/dev/null || true
+  ls -la "${HF_HOME}" 2>/dev/null | head -n 10 | while IFS= read -r _row; do log "diagnostics: hf-cache: ${_row}"; done
+  if printf 'aether-cache-write-test' > "${HF_HOME}/.write-test" 2>/dev/null; then
+    log "diagnostics: hf-cache write test: ok"
+    rm -f "${HF_HOME}/.write-test" 2>/dev/null || true
+  else
+    log "diagnostics: hf-cache write test: FAILED - ${HF_HOME} is not writable"
+  fi
+  token_state="not set"
+  [ -n "${HF_TOKEN:-}" ] && token_state="set"
+  case "$MODEL" in
+    */*)
+      if [ -n "${HF_TOKEN:-}" ]; then
+        code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' -H "Authorization: Bearer ${HF_TOKEN}" "https://huggingface.co/${MODEL}/resolve/main/config.json" 2>/dev/null || true)
+      else
+        code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "https://huggingface.co/${MODEL}/resolve/main/config.json" 2>/dev/null || true)
+      fi
+      log "diagnostics: hf-repo: ${MODEL} status=${code:-000} token=${token_state}"
+      ;;
+    *) log "diagnostics: hf-repo: ${MODEL} is not a Hugging Face repo id - repo check skipped, token=${token_state}" ;;
+  esac
+  log "diagnostics: ---- end ----"
+}
+runtime_diagnostics
+
+# Adapter routing. One source of truth: the same current_adapter.json the vLLM
+# launcher reads. A validated tenant adapter becomes the served model name, so the
+# relay's requests land on that business's LoRA; with nothing approved, the shared
+# base model keeps serving exactly as before.
+ROOT="${AETHER_ROOT:-${WS}/aether}"
+TENANT_ROOT="${AETHER_TENANT_ROOT:-/workspace/tenants}"
+TENANT_ID="${AETHER_TENANT_ID:-}"
+ADAPTER_ALIAS=""
+if [ -n "$TENANT_ID" ] && [ -f "${TENANT_ROOT}/${TENANT_ID}/adapters/llm_lora/current_adapter.json" ]; then
+  ADAPTER_ALIAS=$("$PY_BIN" - "${TENANT_ROOT}/${TENANT_ID}/adapters/llm_lora/current_adapter.json" "$TENANT_ID" <<'PY'
+import json, os, re, sys
+pointer, tenant = sys.argv[1:3]
+try:
+    data = json.load(open(pointer))
+except Exception:
+    raise SystemExit(0)
+path = str(data.get("adapter_path") or "")
+if path and os.path.isdir(path):
+    print(re.sub(r"[^a-z0-9_]", "_", tenant.lower())[:40])
+PY
+)
+fi
+if [ -n "${ADAPTER_ALIAS:-}" ]; then
+  export AETHER_SERVED_MODEL="$ADAPTER_ALIAS"
+  export AETHER_LORA_ALIAS="$ADAPTER_ALIAS"
+  log "adapter routing: serving tenant ${TENANT_ID} adapter as model=${ADAPTER_ALIAS}"
+else
+  log "adapter routing: no approved adapter - serving base model ${MODEL}"
+fi
+
+# ---------------------------------------------------------------------------
+# Independent launchers. Each service is a nohup background process with its own
+# log and its own restart loop; no health gate here can stop its siblings or the
+# container. The loop is bounded in rate (10s backoff), never in attempts.
+# ---------------------------------------------------------------------------
+run_forever() {
+  local name="$1" script="$2"
+  nohup bash -c '
+    while :; do
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] starting '"$script"'"
+      "'"$PY_BIN"'" "'"$ROOT/$script"'"
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] '"$script"' exited rc=$? - restarting in 10s"
+      sleep 10
+    done
+  ' >> "${LOG_DIR}/${name}.log" 2>&1 &
+  echo "$!" > "${LOG_DIR}/${name}.pid"
+  log "launched $name pid=$! log=${LOG_DIR}/${name}.log"
+}
+
+# Poll one service's /health. Returns non-zero on timeout; the caller decides
+# whether that is a hold (vLLM) or just a note (TTS).
+wait_health() {
+  local name="$1" url="$2" timeout="$3" waited=0
+  while [ "$waited" -lt "$timeout" ]; do
+    if curl -fsS -m 5 "$url" >/dev/null 2>&1; then
+      log "health: $name ready after ${waited}s"
+      return 0
+    fi
+    sleep 10
+    waited=$((waited + 10))
+  done
+  log "health: $name did not answer within ${timeout}s"
   return 1
 }
 
-PY="$(select_python || true)"
-if [ -n "$PY" ]; then
-  log "runtime: $PY"
-else
-  PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
-  if [ -z "$PY" ]; then
-    fail_report no_python_interpreter "no python3/python on PATH and no baked interpreter found"
-    exit 1
-  fi
-  log "runtime: $PY (no interpreter reported torch yet — continuing; services report their own health)"
+# 1) Whisper - the Ear.
+run_forever whisper whisper_server.py
+wait_health whisper "http://127.0.0.1:${WHISPER_PORT}/health" "$WHISPER_TIMEOUT" \
+  || log "whisper is not answering yet - continuing, the relay reports it"
+
+# 2) vLLM - the Brain. This gate decides: an engine that never binds 8002 is a
+#    boot failure with the vLLM tail attached, never a silent 10s restart loop.
+run_forever vllm run_vllm_safe.py
+if ! wait_health vllm "http://127.0.0.1:${VLLM_PORT}/health" "$VLLM_TIMEOUT"; then
+  log "vllm.log tail (200 lines):"
+  tail -n 200 "${LOG_DIR}/vllm.log" >> "$SUPERVISOR_LOG" 2>/dev/null || true
+  gate_fail vllm vllm_unhealthy "no /health on ${VLLM_PORT} within ${VLLM_TIMEOUT}s"
 fi
-log "runtime probe: $(tr -s ' ' <<<"$(cat "$PROBE_FILE" 2>/dev/null || echo none)")"
-export AETHER_PYTHON="$PY"
-export PATH="$(dirname "$PY"):$PATH"
 
-# Model caches and voices are the only things this pod needs to persist.
-mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$AETHER_VOICE_DIR" 2>/dev/null || \
-  log "warning: could not create every workspace cache directory"
+# 3) TTS - the Voice. Its health is optional: a process that is alive can still
+#    serve once the speech model finishes loading, so this only notes the state.
+run_forever tts tts_server.py
+wait_health tts "http://127.0.0.1:${TTS_PORT}/health" "$TTS_TIMEOUT" \
+  || log "tts: no /health yet - keeping the process alive"
 
-# -----------------------------------------------------------------------------
-# 2. Served generation + sha256 manifest. The app's manifest is the authority:
-#    a file is only landed once its digest matches the one the app published.
-#    The cache lives on the container disk — /workspace never holds a script.
-# -----------------------------------------------------------------------------
-served_version() {
-  curl -fsS -m 15 "$APP/api/pod-code?name=VERSION" 2>/dev/null | tr -d '[:space:]'
-}
+# 4) The relay last: it is the only public port and it reports upstream readiness.
+run_forever relay voice_relay.py
+wait_health relay "http://127.0.0.1:${RELAY_PORT}/health" "$RELAY_TIMEOUT" \
+  || log "relay is not answering yet - the watchdog keeps reporting"
 
-# The manifest must name the generation we asked for and carry digests.
-fetch_manifest() {
-  mkdir -p "$CACHE_DIR" 2>/dev/null || return 1
-  if ! curl -fsS -m 30 "$APP/api/pod-code?name=manifest" -o "$MANIFEST_FILE.tmp" 2>/dev/null; then
-    rm -f "$MANIFEST_FILE.tmp" 2>/dev/null
-    return 1
-  fi
-  if ! "$PY" - "$MANIFEST_FILE.tmp" "$WANT" <<'PYMANIFESTCHECK' >/dev/null 2>&1
+log "boot complete: whisper=${WHISPER_PORT} vllm=${VLLM_PORT} tts=${TTS_PORT} relay=${RELAY_PORT}"
+
+# ---------------------------------------------------------------------------
+# Watchdog. Every 30s it reads the relay's own health; once every service gate is
+# green it reports ready (that is what binds the tunnel). It never restarts or
+# stops a service. Every 30 minutes it heartbeats the app, which answers whether
+# this pod should stop (idle workspace); and after 120 consecutive minutes of an
+# unhealthy relay it stops the pod itself, which is the only local way to end the
+# provider billing.
+# ---------------------------------------------------------------------------
+heartbeat() {
+  local healthy="$1" body resp
+  [ -n "$APP" ] && [ -n "$SECRET" ] || return 0
+  body=$(python3 - "$POD" "$WS_ID" "$NODE_ID" "$healthy" <<'PY'
 import json, sys
-path, want = sys.argv[1], sys.argv[2]
-data = json.load(open(path))
-files = data.get("files") or []
-if not want or data.get("pod_version") != want or not files:
-    sys.exit(1)
-if any(not entry.get("name") or not entry.get("sha256") for entry in files):
-    sys.exit(1)
-sys.exit(0)
-PYMANIFESTCHECK
-  then
-    rm -f "$MANIFEST_FILE.tmp" 2>/dev/null
-    return 1
-  fi
-  mv -f "$MANIFEST_FILE.tmp" "$MANIFEST_FILE"
-}
-
-manifest_names() {
-  "$PY" - "$1" <<'PYNAMES' 2>/dev/null
-import json, sys
-for entry in json.load(open(sys.argv[1])).get("files", []):
-    if entry.get("name") and entry["name"] != "VERSION":
-        print(entry["name"])
-PYNAMES
-}
-
-manifest_digest() {  # $1 = manifest, $2 = file name
-  "$PY" - "$1" "$2" <<'PYDIGEST' 2>/dev/null
-import json, sys
-for entry in json.load(open(sys.argv[1])).get("files", []):
-    if entry.get("name") == sys.argv[2]:
-        print(entry.get("sha256", ""))
-        break
-PYDIGEST
-}
-
-file_digest() {
-  "$PY" -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1" 2>/dev/null
-}
-
-# The whole tree agrees with the manifest it was landed against.
-verify_tree() {  # $1 = root
-  "$PY" - "$1" <<'PYVERIFY' >/dev/null 2>&1
-import hashlib, json, os, sys
-root = sys.argv[1]
-try:
-    data = json.load(open(os.path.join(root, ".boot-manifest.json")))
-except Exception:
-    sys.exit(1)
-files = data.get("files") or []
-if not files or not data.get("pod_version"):
-    sys.exit(1)
-for entry in files:
-    if entry["name"] == "VERSION":
-        continue
-    path = os.path.join(root, entry["name"])
-    if not os.path.isfile(path):
-        sys.exit(1)
-    if hashlib.sha256(open(path, "rb").read()).hexdigest() != entry["sha256"]:
-        sys.exit(1)
-sys.exit(0)
-PYVERIFY
-}
-
-cache_valid() {
-  [ -n "${WANT:-}" ] || return 1
-  [ -s "$CACHE_DIR/start_all.sh" ] || return 1
-  [ -s "$CACHE_DIR/.boot-manifest.json" ] || return 1
-  "$PY" - "$CACHE_DIR/.boot-manifest.json" "$WANT" <<'PYCACHEVER' >/dev/null 2>&1
-import json, sys
-if json.load(open(sys.argv[1])).get("pod_version") != sys.argv[2]:
-    sys.exit(1)
-sys.exit(0)
-PYCACHEVER
-  verify_tree "$CACHE_DIR"
-}
-
-fetch_all() {
-  local name want_sha got_sha ok=1
-  fetch_manifest || { log "served manifest unavailable for $WANT"; return 1; }
-  for name in $(manifest_names "$MANIFEST_FILE"); do
-    if ! curl -fsS -m 60 "$APP/api/pod-code?name=$name" -o "$CACHE_DIR/$name.tmp" 2>/dev/null; then
-      log "fetch failed: $name"
-      ok=0
-      rm -f "$CACHE_DIR/$name.tmp" 2>/dev/null
-      continue
+pod, ws, node, healthy = sys.argv[1:5]
+print(json.dumps({"probe": "heartbeat", "pod_id": pod, "workspace_id": ws,
+                  "node_id": node, "healthy": healthy == "1"}))
+PY
+)
+  resp=$(curl -sS -m 10 -X POST "$APP/api/runpod-webhook" \
+    -H 'content-type: application/json' -H "x-webhook-secret: $SECRET" --data-binary "$body" 2>/dev/null || true)
+  log "heartbeat healthy=$healthy response=$(printf '%s' "$resp" | tr -d '\n' | cut -c1-200)"
+  if printf '%s' "$resp" | grep -q '"stop": *true'; then
+    log "the app asked this pod to stop (idle or unhealthy) - stopping it now"
+    if command -v runpodctl >/dev/null 2>&1; then
+      runpodctl pod stop "$POD" >> "$DIAG" 2>&1 || true
+    else
+      log "runpodctl is unavailable - the app must stop this pod"
     fi
-    case "$name" in
-      *.sh)
-        if ! bash -n "$CACHE_DIR/$name.tmp" 2>/dev/null; then
-          log "$name failed bash -n — not swapped in"
-          ok=0
-          rm -f "$CACHE_DIR/$name.tmp" 2>/dev/null
-          continue
-        fi ;;
-      *.py)
-        if ! "$PY" -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' "$CACHE_DIR/$name.tmp" 2>/dev/null; then
-          log "$name failed to compile — not swapped in"
-          ok=0
-          rm -f "$CACHE_DIR/$name.tmp" 2>/dev/null
-          continue
-        fi ;;
-    esac
-    want_sha="$(manifest_digest "$MANIFEST_FILE" "$name")"
-    got_sha="$(file_digest "$CACHE_DIR/$name.tmp")"
-    if [ -z "$want_sha" ] || [ "$want_sha" != "$got_sha" ]; then
-      log "$name does not match the served sha256 — not swapped in"
-      ok=0
-      rm -f "$CACHE_DIR/$name.tmp" 2>/dev/null
-      continue
+    hold "stopped on the app's heartbeat instruction"
+  fi
+}
+
+watchdog() {
+  local started ready_reported=0 failure_reported=0 unhealthy_since=0 now health stage reason last_beat
+  started=$(date +%s)
+  last_beat=$started
+  while :; do
+    sleep 30
+    now=$(date +%s)
+    health=$(curl -sS -m 5 "http://127.0.0.1:${RELAY_PORT}/health" 2>/dev/null || true)
+    if printf '%s' "$health" | grep -q '"bind"'; then
+      unhealthy_since=0
+      if [ "$ready_reported" = "0" ] && printf '%s' "$health" | grep -q '"deps_ok": *true'; then
+        report ready
+        ready_reported=1
+        log "all service gates green - reported ready"
+      fi
+    else
+      [ "$unhealthy_since" = "0" ] && unhealthy_since=$now
+      if [ "$ready_reported" = "0" ] && [ "$failure_reported" = "0" ] && [ $((now - started)) -ge "$BOOT_WINDOW" ]; then
+        stage=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("stage",""))' "$FAIL_FILE" 2>/dev/null || true)
+        reason=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("reason",""))' "$FAIL_FILE" 2>/dev/null || true)
+        log "engine not ready after ${BOOT_WINDOW}s (stage=${stage:-none}) - pod stays up for inspection"
+        report boot_failure "${reason:-engine_not_ready}" "${stage:-unknown}"
+        failure_reported=1
+      fi
     fi
-    mv -f "$CACHE_DIR/$name.tmp" "$CACHE_DIR/$name"
-    log "verified and landed: $name"
+    if [ "$unhealthy_since" != "0" ] && [ $((now - unhealthy_since)) -ge 7200 ]; then
+      log "watchdog: relay unhealthy for 120 consecutive minutes - stopping the pod"
+      unhealthy_since=$now
+      heartbeat 0
+      if command -v runpodctl >/dev/null 2>&1; then
+        runpodctl pod stop "$POD" >> "$DIAG" 2>&1 || true
+      else
+        log "runpodctl is unavailable - the app must stop this pod"
+      fi
+    fi
+    if [ $((now - last_beat)) -ge 1800 ]; then
+      last_beat=$now
+      if [ "$unhealthy_since" = "0" ]; then heartbeat 1; else heartbeat 0; fi
+    fi
   done
-  # The manifest is stamped only after every file landed and matched, so a
-  # half-write can never certify itself as a good cache.
-  [ "$ok" = "1" ] || return 1
-  cp -f "$MANIFEST_FILE" "$CACHE_DIR/.boot-manifest.json" 2>/dev/null || return 1
-  printf '%s\n' "$WANT" > "$CACHE_DIR/VERSION" 2>/dev/null || true
-  verify_tree "$CACHE_DIR" || { log "landed tree failed final verification"; return 1; }
 }
 
-WANT=""
-attempt=0
-while [ "$attempt" -lt 12 ] && [ -z "$WANT" ]; do
-  attempt=$(( attempt + 1 ))
-  WANT="$(served_version || true)"
-  [ -n "$WANT" ] || sleep 5
-done
+watchdog >> "${LOG_DIR}/watchdog.log" 2>&1 &
 
-if [ -n "$WANT" ]; then
-  log "served version: $WANT"
-else
-  log "app unreachable at $APP — falling back to cached or baked scripts"
-fi
-
-if [ -n "$WANT" ] && cache_valid; then
-  RUN_ROOT="$CACHE_DIR"
-  log "cache hit $WANT — generation and every sha256 agree"
-elif [ -n "$WANT" ] && fetch_all; then
-  RUN_ROOT="$CACHE_DIR"
-  log "cache miss — fetched $WANT and matched every served sha256"
-elif [ -s "$CACHE_DIR/start_all.sh" ]; then
-  RUN_ROOT="$CACHE_DIR"
-  log "warning: using the cached scripts without a verified manifest"
-elif [ -s "$OFFLINE_ROOT/start_all.sh" ]; then
-  RUN_ROOT="$OFFLINE_ROOT"
-  log "warning: using the baked offline scripts in $OFFLINE_ROOT"
-else
-  fail_report no_supervisor "no verified served scripts and no baked supervisor at $OFFLINE_ROOT"
-  exit 1
-fi
-
-# -----------------------------------------------------------------------------
-# 3. Hand off. The served supervisor owns preflight, the vLLM overlay, the
-#    staged service gates and the ready report; it must run from the SAME
-#    directory as its service scripts, so AETHER_ROOT points at the verified
-#    tree (this entrypoint already did the refresh work).
-# -----------------------------------------------------------------------------
-export AETHER_ROOT="$RUN_ROOT"
-export AETHER_SELF_REFRESHED=1
-log "handing off to $RUN_ROOT/start_all.sh (bootstrap_only=$BOOTSTRAP_ONLY)"
-
-case "${DEBUG_BOOT:-false}" in
-  true|TRUE|1|yes) DEBUG_HOLD=1 ;;
-  *) DEBUG_HOLD=0 ;;
-esac
-if [ "$DEBUG_HOLD" = "1" ]; then
-  log "DEBUG_BOOT on — supervisor runs as a child so this container stays inspectable"
-  bash "$RUN_ROOT/start_all.sh"
-  rc=$?
-  # Bounded, never infinite: even an opted-in debug hold must stop billing on its
-  # own, so a failed boot can never sit on a paid GPU indefinitely.
-  hold="${AETHER_DEBUG_HOLD_SECONDS:-900}"
-  log "supervisor exited rc=$rc — holding the container open ${hold}s (DEBUG_BOOT), then exiting"
-  sleep "$hold"
-  exit "$rc"
-fi
-
-exec bash "$RUN_ROOT/start_all.sh"
+log "container held open with sleep infinity"
+sleep infinity

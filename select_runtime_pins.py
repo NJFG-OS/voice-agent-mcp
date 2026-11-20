@@ -11,12 +11,17 @@ Two gates run, in this order, and the build fails if either has no passing candi
    full (`pip install vllm==<version>`) and then must pass the release gate:
 
        import torch
-       from torch.library import infer_schema
        import vllm
        import vllm._C
 
-   `torch.library.infer_schema` is the exact symbol whose absence crashed every pod
-   on the previous base image, so it is imported explicitly rather than assumed.
+   `vllm._C` is the compiled CUDA extension: if it imports, the wheel was built
+   against the very torch and CUDA this image ships, which is the mismatch that
+   used to surface on a paid GPU instead of here.
+
+   The gate deliberately asserts no private torch symbol. torch.library does not
+   export infer_schema in torch 2.4.x and vLLM never imports it, so requiring it
+   rejected every candidate and turned every healthy pod boot into
+   vllm_import_failed. Only what the runtime actually needs is gated.
 
 2. THE EAR AND THE MOUTH — `voice` in the same manifest: faster-whisper (required)
    and at least one TTS engine from the declared list. Both are imported in the
@@ -35,7 +40,6 @@ import sys
 
 GATE = (
     "import torch\n"
-    "from torch.library import infer_schema\n"
     "import vllm\n"
     "import vllm._C\n"
     "print(torch.__version__, vllm.__version__)\n"
@@ -194,7 +198,7 @@ def main():
             "torch": fields[0] if fields else "unknown",
             "torch_before_vllm": before,
             "vllm": fields[1] if len(fields) > 1 else version,
-            "gate": "torch + torch.library.infer_schema + vllm + vllm._C",
+            "gate": "torch + vllm + vllm._C",
             "selected_from": ladder,
             "rejected": rejected,
         }

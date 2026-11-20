@@ -1,13 +1,13 @@
 {
   "generation": "0.4.1",
   "published_tag": "0.4.1",
-  "gate": "import torch, torch.library.infer_schema, vllm, vllm._C — all four must import in the image's interpreter",
+  "gate": "import torch, vllm, vllm._C — all three must import in the image's interpreter",
   "voice_gate": "import faster_whisper (the Ear) and at least one TTS engine (kokoro or chatterbox) in the same interpreter",
-  "torch_note": "torch.library.infer_schema exists from torch 2.4. A base whose torch is older only passes if the selected vLLM upgrades torch itself, which is why the torch 2.4 base is tried first.",
+  "torch_note": "vllm._C is the compiled CUDA extension, so importing it proves the wheel matches this image's torch and CUDA. No private torch symbol is gated: torch.library does not export infer_schema in torch 2.4.x and vLLM never imports it, and requiring it rejected every candidate.",
   "bases": [
     {
       "image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
-      "torch": "2.4.0",
+      "torch": "2.4.1",
       "vllm": ["0.6.3", "0.6.2", "0.6.0"]
     },
     {

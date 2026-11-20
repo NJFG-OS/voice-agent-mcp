@@ -6,12 +6,12 @@
 #   docker push ghcr.io/njfg-os/voice-agent-mcp:0.4.1
 #
 # WHY 0.4.1 EXISTS
-#   0.2.2 was built from a base whose torch is 2.3.1, which has no
-#   torch.library.infer_schema and no /opt/aether/runtime-pins.json. Every pod
-#   booted with it failed the vLLM gate (vllm_import_failed) and nothing listened
-#   on 8000/8002/8080. The ladder now starts on a torch 2.4 base, where the exact
-#   symbol the boot gate imports already exists, and the manifest's vLLM versions
-#   are real published releases so a candidate can actually pass.
+#   Every pod reported vllm_import_failed, and the cause was the gate itself: both
+#   this build gate and the pod's boot gate imported torch.library.infer_schema,
+#   which torch 2.4.x does not export at all and which vLLM never imports, so a
+#   healthy vLLM was rejected on every boot. The gate now asserts the real contract
+#   — torch, vllm and vllm._C — and the manifest's vLLM versions are real published
+#   releases, so a candidate can actually pass.
 #
 # WHAT CHANGED FROM 0.3.x
 #   * The Ear and the Mouth are baked in too: faster-whisper and one TTS engine
@@ -27,9 +27,9 @@
 #   * vLLM is installed HERE, at build time, through select_runtime_pins.py. No pod
 #     runs `pip install` any more: a runtime install is what pulled a CUDA stack
 #     and broke every boot.
-#   * The build gate is the release gate. torch, torch.library.infer_schema, vllm,
-#     vllm._C, faster_whisper and a TTS module must all import in the image's own
-#     interpreter or the RUN fails, no image is produced and nothing is published.
+#   * The build gate is the release gate. torch, vllm, vllm._C, faster_whisper and
+#     a TTS module must all import in the image's own interpreter or the RUN fails,
+#     no image is produced and nothing is published.
 #   * The app stack starts from /post_start.sh — the hook RunPod's /start.sh runs
 #     after sshd and Jupyter are already up. There is deliberately NO ENTRYPOINT
 #     and NO CMD here: setting either would clobber the provider's startup.
