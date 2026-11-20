@@ -25,6 +25,12 @@ DIAG="${LOG_DIR}/boot_diag.log"
 FAIL_FILE="${LOG_DIR}/boot_failed.json"
 LEGACY_FAIL_FILE="${LOG_DIR}/boot_fail.json"
 RUNTIME_PROBE_FILE="${LOG_DIR}/runtime-probe.txt"
+# The stage this boot is in, written atomically before every long step. The relay
+# serves it from /health, so a stalled boot is diagnosable over port 8000 alone.
+STAGE_FILE="${LOG_DIR}/stage.json"
+# Written once, the first time a stall inside the boot window is provable, so the
+# early failure report is not repeated on every poll.
+STALL_FILE="${LOG_DIR}/boot_stalled.flag"
 
 # The generation this script IS. /api/pod-code substitutes its served version here,
 # so the pin is compared against the bytes about to run, not a guess.
@@ -97,6 +103,16 @@ log() {
 hold() {
   log "container held open for inspection: $1"
   sleep infinity
+}
+
+# Announce the step this boot is in. Atomic (write then rename), so the relay never
+# reads half a record. This is the file /health reports as "stage".
+stage() {
+  local name="$1" detail="${2:-}"
+  printf '{"stage":"%s","detail":"%s","since":"%s"}' \
+    "$name" "${detail//\"/}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    > "${STAGE_FILE}.tmp" 2>/dev/null && mv "${STAGE_FILE}.tmp" "$STAGE_FILE" 2>/dev/null
+  log "stage: $name${detail:+ ($detail)}"
 }
 
 # ---------------------------------------------------------------------------
@@ -527,31 +543,74 @@ wait_health() {
   return 1
 }
 
-# 1) Whisper - the Ear.
-run_forever whisper whisper_server.py
-wait_health whisper "http://127.0.0.1:${WHISPER_PORT}/health" "$WHISPER_TIMEOUT" \
-  || log "whisper is not answering yet - continuing, the relay reports it"
+# The engine gate, with progress. Every 30s it records how long the engine has been
+# starting and the last line its own log produced, so a stall is visible while it is
+# happening instead of being inferred from a silent port. Past the boot window it
+# writes the failure record ONCE and keeps waiting: the engine may still come up.
+wait_health_progress() {
+  local name="$1" url="$2" timeout="$3" waited=0 last
+  while [ "$waited" -lt "$timeout" ]; do
+    if curl -fsS -m 5 "$url" >/dev/null 2>&1; then
+      log "health: $name ready after ${waited}s"
+      return 0
+    fi
+    if [ $((waited % 30)) -eq 0 ]; then
+      last=$(tail -n 1 "${LOG_DIR}/${name}.log" 2>/dev/null | tr -d '\r' | cut -c1-180)
+      log "health: $name still starting after ${waited}s (last log: ${last:-none})"
+      if [ "$waited" -ge "$BOOT_WINDOW" ] && [ ! -f "$STALL_FILE" ]; then
+        : > "$STALL_FILE" 2>/dev/null || true
+        stage "${name}_stalled" "no /health after ${waited}s"
+        write_fail "$name" "${name}_stalled" "no /health on $url after ${waited}s"
+        report boot_failure "${name}_stalled" "$name"
+      fi
+    fi
+    sleep 10
+    waited=$((waited + 10))
+  done
+  log "health: $name did not answer within ${timeout}s"
+  return 1
+}
 
-# 2) vLLM - the Brain. This gate decides: an engine that never binds 8002 is a
-#    boot failure with the vLLM tail attached, never a silent 10s restart loop.
+# 1) The relay FIRST. It is the pod's only public port and it needs no engine to
+#    bind, so it starts before anything loads. Binding 8000 only after the engines
+#    were healthy is what made a slow boot look like a dead pod: until something
+#    listens on 8000 the RunPod proxy answers 502, so there was no way to see how
+#    far the boot had got. /health now reports the stage from the first second.
+stage relay_start "binding 8000 before the engines load"
+run_forever relay voice_relay.py
+wait_health relay "http://127.0.0.1:${RELAY_PORT}/health" "$RELAY_TIMEOUT" \
+  || log "relay did not answer within ${RELAY_TIMEOUT}s - the watchdog keeps reporting"
+
+# 2) The engines are launched TOGETHER. They are independent processes, so gating
+#    one behind another only added their load times up: Whisper's model used to hold
+#    vLLM's start for up to ${WHISPER_TIMEOUT}s, and only then did the weights
+#    download begin - which is how a cold boot reached 20+ minutes. Concurrent start
+#    is the single biggest saving here.
+stage whisper_start "faster-whisper loading"
+run_forever whisper whisper_server.py
+stage vllm_start "engine launching (weights download on a cold cache is the slow part)"
 run_forever vllm run_vllm_safe.py
-if ! wait_health vllm "http://127.0.0.1:${VLLM_PORT}/health" "$VLLM_TIMEOUT"; then
+stage tts_start "speech worker loading"
+run_forever tts tts_server.py
+
+# 3) vLLM - the Brain. This gate decides: an engine that never binds 8002 is a named
+#    failure with the vLLM tail attached, never a silent 10s restart loop.
+stage vllm_wait "waiting for /health on ${VLLM_PORT}"
+if ! wait_health_progress vllm "http://127.0.0.1:${VLLM_PORT}/health" "$VLLM_TIMEOUT"; then
   log "vllm.log tail (200 lines):"
   tail -n 200 "${LOG_DIR}/vllm.log" >> "$SUPERVISOR_LOG" 2>/dev/null || true
   gate_fail vllm vllm_unhealthy "no /health on ${VLLM_PORT} within ${VLLM_TIMEOUT}s"
 fi
+stage vllm_ready "engine answered /health on ${VLLM_PORT}"
 
-# 3) TTS - the Voice. Its health is optional: a process that is alive can still
-#    serve once the speech model finishes loading, so this only notes the state.
-run_forever tts tts_server.py
+# 4) The Ear and the Voice are noted, not gated: the relay's own deps_ok reports
+#    them, and a process that is alive still serves once its model finishes loading.
+wait_health whisper "http://127.0.0.1:${WHISPER_PORT}/health" "$WHISPER_TIMEOUT" \
+  || log "whisper is not answering yet - continuing, the relay reports it"
 wait_health tts "http://127.0.0.1:${TTS_PORT}/health" "$TTS_TIMEOUT" \
   || log "tts: no /health yet - keeping the process alive"
 
-# 4) The relay last: it is the only public port and it reports upstream readiness.
-run_forever relay voice_relay.py
-wait_health relay "http://127.0.0.1:${RELAY_PORT}/health" "$RELAY_TIMEOUT" \
-  || log "relay is not answering yet - the watchdog keeps reporting"
-
+stage services_ready "whisper=${WHISPER_PORT} vllm=${VLLM_PORT} tts=${TTS_PORT} relay=${RELAY_PORT}"
 log "boot complete: whisper=${WHISPER_PORT} vllm=${VLLM_PORT} tts=${TTS_PORT} relay=${RELAY_PORT}"
 
 # ---------------------------------------------------------------------------
