@@ -308,6 +308,23 @@ def main():
         )
         return 3
 
+    # A 7-8B model in bf16 is ~15-16GB of weights BEFORE any KV cache. On a card under
+    # 24.6GB (an L4 reports 23034MiB) 0.65 of its memory is less than that, so vLLM
+    # loads the weights, finds no room for cache blocks and exits - and the restart
+    # loop turned that into a silent 20-minute stall with nothing on 8002. Exactly
+    # those cards get a raised profile and a shorter context instead.
+    global GPU_UTIL, MAX_MODEL_LEN, MAX_NUM_SEQS
+    if vram_mb < 24564 and not os.environ.get("AETHER_PROFILE_OVERRIDE"):
+        GPU_UTIL = "0.88"
+        MAX_MODEL_LEN = min(MAX_MODEL_LEN, 2048)
+        MAX_NUM_SEQS = min(MAX_NUM_SEQS, 2)
+        print(
+            "run_vllm_safe: %.1fGB card - profile raised to util=%s max_model_len=%d max_seqs=%d "
+            "(a 7-8B bf16 model does not fit in 0.65 of this card)"
+            % (as_gb(vram_mb), GPU_UTIL, MAX_MODEL_LEN, MAX_NUM_SEQS),
+            flush=True,
+        )
+
     deep_gemm = neutralise_deep_gemm()
 
     env = dict(os.environ)

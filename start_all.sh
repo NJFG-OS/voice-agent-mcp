@@ -517,12 +517,27 @@ fi
 # container. The loop is bounded in rate (10s backoff), never in attempts.
 # ---------------------------------------------------------------------------
 run_forever() {
-  local name="$1" script="$2"
+  local name="$1" script="$2" max_crashes="${3:-0}"
   nohup bash -c '
+    crashes=0
     while :; do
+      began=$(date +%s)
       echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] starting '"$script"'"
       "'"$PY_BIN"'" "'"$ROOT/$script"'"
-      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] '"$script"' exited rc=$? - restarting in 10s"
+      rc=$?
+      ran=$(( $(date +%s) - began ))
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] '"$script"' exited rc=$rc after ${ran}s"
+      # A service that dies inside a minute is crashing, not restarting. Without a
+      # cap the loop hides that behind endless retries and the boot gate just waits
+      # out its window - which is how an engine that OOMs on every start looked like
+      # a 20-minute hang. After the cap the loop stops so the gate can name it.
+      if [ "$ran" -lt 60 ]; then crashes=$((crashes + 1)); else crashes=0; fi
+      if [ "'"$max_crashes"'" -gt 0 ] && [ "$crashes" -ge "'"$max_crashes"'" ]; then
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] '"$script"' crashed ${crashes}x inside 60s - restart loop stopped"
+        # break, never exit: this is a child loop, and the supervisor itself must stay
+        # alive (an exit here would restart the whole container).
+        break
+      fi
       sleep 10
     done
   ' >> "${LOG_DIR}/${name}.log" 2>&1 &
@@ -556,6 +571,12 @@ wait_health_progress() {
     if curl -fsS -m 5 "$url" >/dev/null 2>&1; then
       log "health: $name ready after ${waited}s"
       return 0
+    fi
+    # A bounded restart loop that gave up leaves no process behind: fail at once
+    # instead of waiting out a window for a service that is no longer running.
+    if [ -f "${LOG_DIR}/${name}.pid" ] && ! kill -0 "$(cat "${LOG_DIR}/${name}.pid" 2>/dev/null)" 2>/dev/null; then
+      log "health: $name has no running process (its restart loop stopped) - failing now"
+      return 1
     fi
     if [ $((waited % 30)) -eq 0 ]; then
       last=$(tail -n 1 "${LOG_DIR}/${name}.log" 2>/dev/null | tr -d '\r' | cut -c1-180)
@@ -592,7 +613,9 @@ wait_health relay "http://127.0.0.1:${RELAY_PORT}/health" "$RELAY_TIMEOUT" \
 stage whisper_start "faster-whisper loading"
 run_forever whisper whisper_server.py
 stage vllm_start "engine launching (weights download on a cold cache is the slow part)"
-run_forever vllm run_vllm_safe.py
+# Five crashes inside a minute is not a flaky start: the engine cannot run here, and
+# waiting out a 30-minute window to say so helps nobody.
+run_forever vllm run_vllm_safe.py 5
 stage tts_start "speech worker loading"
 run_forever tts tts_server.py
 
