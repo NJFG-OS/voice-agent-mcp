@@ -91,6 +91,14 @@ def torch_version():
     return out.splitlines()[-1].strip() if code == 0 and out else "unavailable"
 
 
+def declared_torch(data, base):
+    """The torch LABEL the manifest states for this base, or "" when unstated."""
+    for entry in data.get("bases") or []:
+        if str(entry.get("image") or "").strip() == base:
+            return str(entry.get("torch") or "").strip()
+    return ""
+
+
 def install_voice(pins, voice):
     """The Ear and the Mouth, installed and imported in the image's interpreter.
 
@@ -174,7 +182,16 @@ def main():
         return 0
 
     before = torch_version()
-    print("select_runtime_pins: base=%s torch_before_vllm=%s" % (args.base, before))
+    declared = declared_torch(data, args.base)
+    print("select_runtime_pins: base=%s torch_before_vllm=%s declared=%s" % (args.base, before, declared or "unstated"))
+    # The label is documentation, never a gate: a base image's tag and its torch can
+    # disagree (the cuda12.4.1 tag ships torch 2.4.0+cu121), and the image wins.
+    if declared and declared not in ("unverified", before):
+        print(
+            "select_runtime_pins: WARNING manifest declares torch %s but the image ships %s - recording the image's own"
+            % (declared, before),
+            file=sys.stderr,
+        )
 
     rejected = []
     for version in ladder:
@@ -197,6 +214,8 @@ def main():
             "base_image": args.base,
             "torch": fields[0] if fields else "unknown",
             "torch_before_vllm": before,
+            "declared_torch": declared,
+            "torch_matches_manifest": (fields[0] == declared) if declared and declared != "unverified" else None,
             "vllm": fields[1] if len(fields) > 1 else version,
             "gate": "torch + vllm + vllm._C",
             "selected_from": ladder,
