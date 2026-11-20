@@ -1,0 +1,26 @@
+{
+  "generation": "0.4.1",
+  "published_tag": "0.4.1",
+  "gate": "import torch, torch.library.infer_schema, vllm, vllm._C — all four must import in the image's interpreter",
+  "voice_gate": "import faster_whisper (the Ear) and at least one TTS engine (kokoro or chatterbox) in the same interpreter",
+  "torch_note": "torch.library.infer_schema exists from torch 2.4. A base whose torch is older only passes if the selected vLLM upgrades torch itself, which is why the torch 2.4 base is tried first.",
+  "bases": [
+    {
+      "image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+      "torch": "2.4.0",
+      "vllm": ["0.6.3", "0.6.2", "0.6.0"]
+    },
+    {
+      "image": "runpod/pytorch:2.1.0-cu1320-torch2130-ubuntu2404",
+      "torch": "2.3.1",
+      "vllm": ["0.6.3", "0.6.2"]
+    }
+  ],
+  "voice": {
+    "whisper": "faster-whisper==1.1.1",
+    "tts": [
+      { "package": "kokoro>=0.9.4", "module": "kokoro" },
+      { "package": "chatterbox-tts", "module": "chatterbox" }
+    ]
+  }
+}
