@@ -123,6 +123,15 @@ RUN export LD_LIBRARY_PATH="/opt/aether/cuda-stub:${LD_LIBRARY_PATH:-}" \
     && python3 -c "import torch, vllm, faster_whisper; print('brain+ear ok', torch.__version__, vllm.__version__)" \
     && python3 -c "import importlib, json; pins=json.load(open('/opt/aether/runtime-pins.json')); importlib.import_module(pins['tts_module']); print('mouth ok', pins['tts'])"
 
+# THE RELAY'S OWN DEPENDENCIES, proven at build time. voice_relay.py binds 8000 with
+# aiohttp: if that wheel is missing the relay crash-loops on import and the pod's only
+# public port never opens, which reads as a dead pod rather than a missing package.
+# aiohttp normally arrives with the base image's Jupyter, but "normally" is not a
+# contract, so it is installed here when absent and then import-gated like the rest.
+RUN python3 -c "import aiohttp" 2>/dev/null \
+    || python3 -m pip install --no-cache-dir aiohttp \
+    && python3 -c "import aiohttp; print('relay deps ok', aiohttp.__version__)"
+
 # The app stack. /start.sh (the base image's entrypoint) runs this after sshd and
 # Jupyter are up, so the pod stays reachable while the engine boots.
 COPY post_start.sh /post_start.sh
