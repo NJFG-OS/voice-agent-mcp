@@ -5,8 +5,8 @@
 # Builds the NEXT generation on top of the current one, so the baked Python
 # runtime is kept and only the boot entrypoint is replaced.
 #
-#   docker build -t ghcr.io/njfg-os/voice-agent-mcp:0.2.1 .
-#   docker push ghcr.io/njfg-os/voice-agent-mcp:0.2.1
+#   docker build -t ghcr.io/njfg-os/voice-agent-mcp:0.2.2 .
+#   docker push ghcr.io/njfg-os/voice-agent-mcp:0.2.2
 #
 # Rules this file follows
 #   * BASE_IMAGE is the PREVIOUS generation, never the tag being built. A tag is
@@ -53,7 +53,7 @@ ENV AETHER_APP_ORIGIN=https://deft-aether-voice-core.base44.app \
     HF_HOME=/workspace/hf-cache \
     PIP_CACHE_DIR=/workspace/pip-cache \
     PYTHONUNBUFFERED=1 \
-    AETHER_IMAGE_VERSION=0.2.1
+    AETHER_IMAGE_VERSION=0.2.2
 
 # The entrypoint. Everything else (supervisor, whisper, vLLM launcher, relay,
 # TTS) is fetched and sha256-verified from the app at boot.

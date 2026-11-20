@@ -39,4 +39,4 @@ jobs:
           context: .
           file: Dockerfile
           push: true
-          tags: ghcr.io/njfg-os/voice-agent-mcp:0.2.1
+          tags: ghcr.io/njfg-os/voice-agent-mcp:0.2.2
