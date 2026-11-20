@@ -1,9 +1,19 @@
-name: Docker Image CI
+# ONE workflow builds the image. It replaces docker-image.yml, docker-publish.yml
+# and publish.yml: those three pushed 0.2.0, 1.0.0 and 1.0.1 from the same
+# Dockerfile, so no build ever produced the tag the app pins.
+#
+# The tag here must equal the tag the app pins (POD_IMAGE in
+# src/lib/runpod.server.js). Bump both together.
+name: docker-image
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [main]
+    paths:
+      - Dockerfile
+      - start_all.sh
+      - .github/workflows/docker-image.yml
 
 permissions:
   contents: read
@@ -29,4 +39,4 @@ jobs:
           context: .
           file: Dockerfile
           push: true
-          tags: ghcr.io/njfg-os/voice-agent-mcp:0.2.0
+          tags: ghcr.io/njfg-os/voice-agent-mcp:0.2.1
