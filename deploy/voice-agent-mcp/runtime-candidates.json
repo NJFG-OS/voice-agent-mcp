@@ -24,7 +24,7 @@
     "transformers": "transformers==4.47.1",
     "transformers_note": "Kokoro's warm-up failed on the transformers its TTS wheel pulled in. The in-container fix (4.47.1) only lasted as long as that container, so a fresh pod hit the same failure. The selector installs this pin AFTER the engines and re-imports the chosen engine, so the image carries the fix and proves it still loads.",
     "numpy": "numpy>=2.0,<2.3",
-    "numpy_note": "numpy 2.x is what pyarrow and datasets resolve against, but torch 2.4.x wheels were built against numpy 1.x, so the pin is installed LAST and then the whole stack is imported together in one interpreter: torch, vllm, vllm._C, transformers, faster-whisper, the chosen TTS engine and pyarrow/datasets when present. A pin that fails that gate is rolled back to the numpy the image already had and recorded as numpy_source=rolled_back, so a published image never carries a numpy its own runtime cannot import.",
+    "numpy_note": "numpy 2.x is what pyarrow and datasets resolve against, but torch 2.4.x wheels were built against numpy 1.x, so the pin is installed LAST and then the whole stack is imported together in one interpreter: torch, vllm, vllm._C, transformers, faster-whisper, the chosen TTS engine and every optional extra (pyarrow/datasets) that already imported before the pin. A pin that fails that gate is rolled back to the numpy the image already had and recorded as numpy_source=rolled_back; extras that were already broken in the base image are recorded in numpy_extras and never counted against the pin.",
     "tts": [
       { "package": "kokoro>=0.9.4", "module": "kokoro" },
       { "package": "chatterbox-tts", "module": "chatterbox" }

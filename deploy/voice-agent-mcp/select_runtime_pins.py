@@ -26,13 +26,18 @@ Two gates run, in this order, and the build fails if either has no passing candi
 2. THE EAR AND THE MOUTH — `voice` in the same manifest: faster-whisper (required)
    and at least one TTS engine from the declared list. Both are imported in the
    image's own interpreter, so a pod can never boot without them and then report
-   tts:false in its health contract.
+   tts:false in its health contract. Their transformers is then pinned.
+
+3. NUMPY — the one pin that can break all of the above at once. It is installed last
+   and the WHOLE stack is imported together; a pin that fails is rolled back to the
+   numpy the image already had and recorded. Optional extras (pyarrow, datasets) are
+   baselined first and only re-required when they already imported, so a package that
+   was broken in the base image never fails a numpy change it did not cause.
 
 A candidate that fails is uninstalled and the next one is tried. When every
 candidate fails the script exits non-zero, the `RUN` step fails, the image is never
 produced and nothing is published. Fail closed, by construction.
-"""
-import argparse
+"""import argparse
 import json
 import os
 import subprocess
@@ -67,29 +72,58 @@ NUMPY_GATE = (
 )
 
 
-def stack_gate_source(module):
+def stack_gate_source(module, extras=()):
     """Everything that shares this numpy, imported together in one interpreter.
 
     A numpy pin is only safe when the WHOLE stack still imports with it: torch 2.4.x
     wheels were built against numpy 1.x, and vLLM, transformers, faster-whisper and
-    the TTS engine all share the same array ABI. pyarrow and datasets are imported
-    too when the image carries them, because those are the packages that need 2.x -
-    gating them keeps the training pod's imports from breaking on a later boot.
+    the TTS engine all share the same array ABI.
+
+    `extras` is the list of optional packages that ALREADY imported before the pin
+    (pyarrow, datasets). Only those are required again afterwards: a package that was
+    already broken in the base image is reported, never turned into a build failure
+    for a numpy change that did not cause it.
     """
     lines = [
         "import importlib",
-        "import importlib.util",
         "import numpy, torch, vllm, vllm._C, transformers, faster_whisper",
     ]
     if module:
         lines.append("importlib.import_module(%r)" % module)
-    lines.extend([
-        "for _name in ('pyarrow', 'datasets'):",
-        "    if importlib.util.find_spec(_name) is not None:",
-        "        importlib.import_module(_name)",
-        "print(numpy.__version__, torch.__version__, vllm.__version__, transformers.__version__)",
-    ])
+    for name in extras or ():
+        lines.append("importlib.import_module(%r)" % name)
+    lines.append("print(numpy.__version__, torch.__version__, vllm.__version__, transformers.__version__)")
     return "\n".join(lines) + "\n"
+
+
+# The optional training extras. They are NOT part of the inference contract, so they
+# are baselined before the pin and only re-required when they already imported.
+EXTRAS = ("pyarrow", "datasets")
+
+
+def extras_state():
+    """Which optional extras import in this image right now, before any pin."""
+    probe = (
+        "import importlib, importlib.util, json\n"
+        "out = {}\n"
+        "for name in %r:\n"
+        "    if importlib.util.find_spec(name) is None:\n"
+        "        out[name] = 'absent'\n"
+        "        continue\n"
+        "    try:\n"
+        "        importlib.import_module(name)\n"
+        "        out[name] = 'ok'\n"
+        "    except Exception as error:\n"
+        "        out[name] = type(error).__name__\n"
+        "print(json.dumps(out))\n"
+    ) % (EXTRAS,)
+    code, out, _ = run([sys.executable, "-c", probe], timeout=GATE_TIMEOUT)
+    if code != 0 or not out:
+        return {}
+    try:
+        return json.loads(out.splitlines()[-1])
+    except Exception:
+        return {}
 
 INSTALL_TIMEOUT = 3600
 GATE_TIMEOUT = 900
@@ -254,6 +288,14 @@ def pin_numpy(pins, voice):
         return 0
     module = str(pins.get("tts_module") or "")
     before = installed_numpy()
+    # What already imports TODAY. A package that is broken in the base image (datasets
+    # against the hub transformers 4.47.1 pins, pyarrow against numpy 1.x) is reported
+    # in the pins and never counted against the numpy pin that did not cause it.
+    baseline = extras_state()
+    required = [name for name, state in baseline.items() if state == "ok"]
+    pins["numpy_extras"] = baseline
+    if any(state not in ("ok", "absent") for state in baseline.values()):
+        print("select_runtime_pins: extras already broken before the pin: %s" % baseline)
     print("select_runtime_pins: installing %s (image has %s)" % (package, before or "none"))
 
     code, out, err = run([sys.executable, "-m", "pip", "install", "--no-cache-dir", package])
@@ -264,7 +306,7 @@ def pin_numpy(pins, voice):
         )
         return 1
 
-    code, out, err = run([sys.executable, "-c", stack_gate_source(module)], timeout=GATE_TIMEOUT)
+    code, out, err = run([sys.executable, "-c", stack_gate_source(module, required)], timeout=GATE_TIMEOUT)
     if code == 0:
         fields = out.split()
         pins["numpy"] = fields[0] if fields else package
@@ -288,14 +330,13 @@ def pin_numpy(pins, voice):
         )
         return 1
 
-    code, out, err = run([sys.executable, "-c", stack_gate_source(module)], timeout=GATE_TIMEOUT)
+    code, out, err = run([sys.executable, "-c", stack_gate_source(module, required)], timeout=GATE_TIMEOUT)
     if code != 0:
         print(
             "select_runtime_pins: the image's own numpy no longer imports the stack: %s" % ((err or out)[-800:]),
             file=sys.stderr,
         )
         return 1
-
     fields = out.split()
     pins["numpy"] = fields[0] if fields else before or "unknown"
     pins["numpy_source"] = "rolled_back"
