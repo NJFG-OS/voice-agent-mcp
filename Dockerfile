@@ -1,9 +1,17 @@
 # syntax=docker/dockerfile:1
 # =============================================================================
-# AetherVoice — voice-agent-mcp image  (generation 0.4.1)
+# AetherVoice — voice-agent-mcp image  (generation 0.4.2)
 #
-#   docker build -t ghcr.io/njfg-os/voice-agent-mcp:0.4.1 .
-#   docker push ghcr.io/njfg-os/voice-agent-mcp:0.4.1
+#   docker build -t ghcr.io/njfg-os/voice-agent-mcp:0.4.2 .
+#   docker push ghcr.io/njfg-os/voice-agent-mcp:0.4.2
+#
+# WHY 0.4.2 EXISTS
+#   The Mouth's transformers is pinned. Kokoro's warm-up failed on the transformers
+#   its TTS wheel pulled in, and the in-container fix (transformers==4.47.1) lived
+#   only as long as that container: every fresh pod hit the same failure again. The
+#   pin is installed from runtime-candidates.json AFTER the engines, the chosen
+#   engine is re-imported, and the finished image asserts the exact version. The
+#   runtime contract is otherwise 0.4.1's.
 #
 # WHY 0.4.1 EXISTS
 #   Every pod reported vllm_import_failed, and the cause was the gate itself: both
@@ -78,7 +86,7 @@ ENV AETHER_APP_ORIGIN=https://deft-aether-voice-core.base44.app \
     AETHER_VLLM_PORT=8002 \
     AETHER_TTS_PORT=8080 \
     PYTHONUNBUFFERED=1 \
-    AETHER_IMAGE_VERSION=0.4.1
+    AETHER_IMAGE_VERSION=0.4.2
 
 COPY runtime-candidates.json /opt/aether/runtime-candidates.json
 COPY select_runtime_pins.py /opt/aether/select_runtime_pins.py
@@ -122,6 +130,14 @@ RUN export LD_LIBRARY_PATH="/opt/aether/cuda-stub:${LD_LIBRARY_PATH:-}" \
 RUN export LD_LIBRARY_PATH="/opt/aether/cuda-stub:${LD_LIBRARY_PATH:-}" \
     && python3 -c "import torch, vllm, faster_whisper; print('brain+ear ok', torch.__version__, vllm.__version__)" \
     && python3 -c "import importlib, json; pins=json.load(open('/opt/aether/runtime-pins.json')); importlib.import_module(pins['tts_module']); print('mouth ok', pins['tts'])"
+
+# THE MOUTH'S TRANSFORMERS, proven from the finished image. Kokoro's warm-up failed
+# on the transformers its TTS wheel pulled in; the in-container fix
+# (transformers==4.47.1) never survived that container, so every fresh pod hit the
+# same failure. select_runtime_pins.py installs the manifest's voice.transformers
+# after the engines; this step proves the pin is really the version in the image, so
+# a build that lost it fails here instead of shipping a pod that cannot speak.
+RUN python3 -c "import json, transformers; pins=json.load(open('/opt/aether/runtime-pins.json')); want=pins.get('transformers',''); assert want, 'pins name no transformers'; assert want.split('==')[-1] == transformers.__version__, 'transformers %s is not %s' % (transformers.__version__, want); print('mouth transformers ok', want)"
 
 # THE RELAY'S OWN DEPENDENCIES, proven at build time. voice_relay.py binds 8000 with
 # aiohttp: if that wheel is missing the relay crash-loops on import and the pod's only

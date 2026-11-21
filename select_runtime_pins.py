@@ -56,6 +56,11 @@ TTS_GATE = (
     "print(getattr(m, '__version__', 'unknown'))\n"
 )
 
+TRANSFORMERS_GATE = (
+    "import transformers\n"
+    "print(transformers.__version__)\n"
+)
+
 INSTALL_TIMEOUT = 3600
 GATE_TIMEOUT = 900
 
@@ -145,11 +150,55 @@ def install_voice(pins, voice):
         pins["tts_module"] = module
         pins["tts_version"] = out.splitlines()[-1].strip() if out else "unknown"
         pins["tts_rejected"] = rejected
-        return 0
+        return pin_transformers(pins, voice)
 
     pins["tts_rejected"] = rejected
     print("select_runtime_pins: no TTS engine passed the import gate", file=sys.stderr)
     return 1
+
+
+def pin_transformers(pins, voice):
+    """The Mouth's transformers, pinned AFTER the engines are installed.
+
+    Kokoro's warm-up failed on the transformers its own wheel pulled in, and the
+    in-container fix (transformers==4.47.1) lived only as long as that container:
+    every fresh pod hit the same failure again. Installing the pin last makes it
+    win over whatever the TTS wheel resolved, and re-importing the chosen engine
+    afterwards proves the fix holds with the engine already present. A failure
+    here fails the build, so an image that cannot speak is never published.
+    """
+    package = str((voice or {}).get("transformers") or "").strip()
+    if not package:
+        return 0
+    print("select_runtime_pins: installing %s (tts runtime pin)" % package)
+    code, out, err = run([sys.executable, "-m", "pip", "install", "--no-cache-dir", package])
+    if code != 0:
+        print(
+            "select_runtime_pins: %s failed to install: %s" % (package, (err or out)[-800:]),
+            file=sys.stderr,
+        )
+        return 1
+    code, out, err = run([sys.executable, "-c", TRANSFORMERS_GATE], timeout=GATE_TIMEOUT)
+    if code != 0:
+        print(
+            "select_runtime_pins: %s failed the import gate: %s" % (package, (err or out)[-800:]),
+            file=sys.stderr,
+        )
+        return 1
+    pins["transformers"] = package
+    pins["transformers_version"] = out.splitlines()[-1].strip() if out else "unknown"
+
+    module = str(pins.get("tts_module") or "").strip()
+    if module:
+        code, out, err = run([sys.executable, "-c", TTS_GATE.format(module=module)], timeout=GATE_TIMEOUT)
+        if code != 0:
+            print(
+                "select_runtime_pins: %s no longer imports with %s: %s"
+                % (module, package, (err or out)[-800:]),
+                file=sys.stderr,
+            )
+            return 1
+    return 0
 
 
 def main():
