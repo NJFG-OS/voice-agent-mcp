@@ -1,9 +1,17 @@
 # syntax=docker/dockerfile:1
 # =============================================================================
-# AetherVoice — voice-agent-mcp image  (generation 0.4.1)
+# AetherVoice — voice-agent-mcp image  (generation 0.4.2)
 #
-#   docker build -t ghcr.io/njfg-os/voice-agent-mcp:0.4.1 .
-#   docker push ghcr.io/njfg-os/voice-agent-mcp:0.4.1
+#   docker build -t ghcr.io/njfg-os/voice-agent-mcp:0.4.2 .
+#   docker push ghcr.io/njfg-os/voice-agent-mcp:0.4.2
+#
+# WHY 0.4.2 EXISTS
+#   The Mouth's transformers is pinned. Kokoro's warm-up failed on the transformers
+#   its TTS wheel pulled in, and the in-container fix (transformers==4.47.1) lived
+#   only as long as that container: every fresh pod hit the same failure again. The
+#   pin is installed from runtime-candidates.json AFTER the engines, the chosen
+#   engine is re-imported, and the finished image asserts the exact version. The
+#   runtime contract is otherwise 0.4.1's.
 #
 # WHY 0.4.1 EXISTS
 #   Every pod reported vllm_import_failed, and the cause was the gate itself: both
@@ -78,7 +86,7 @@ ENV AETHER_APP_ORIGIN=https://deft-aether-voice-core.base44.app \
     AETHER_VLLM_PORT=8002 \
     AETHER_TTS_PORT=8080 \
     PYTHONUNBUFFERED=1 \
-    AETHER_IMAGE_VERSION=0.4.1
+    AETHER_IMAGE_VERSION=0.4.2
 
 COPY runtime-candidates.json /opt/aether/runtime-candidates.json
 COPY select_runtime_pins.py /opt/aether/select_runtime_pins.py
