@@ -8,6 +8,12 @@
 # venv, no chmod that can fail a boot. vLLM is baked into the image.
 set -uo pipefail
 
+# One live call holds a Twilio media socket plus the relay's upstream HTTP
+# connections, and the base image's soft limit is 1024: a busy pod hits EMFILE,
+# which surfaces as a dropped stream rather than as a limit. Raised once here, so
+# every child process inherits it.
+ulimit -n 65536 2>/dev/null || true
+
 WS="${AETHER_WORKSPACE_DIR:-/workspace}"
 
 # Logs first: a boot that fails before this point has nowhere to explain itself.
@@ -34,7 +40,7 @@ STALL_FILE="${LOG_DIR}/boot_stalled.flag"
 
 # The generation this script IS. /api/pod-code substitutes its served version here,
 # so the pin is compared against the bytes about to run, not a guess.
-SERVED_VERSION="test"
+SERVED_VERSION="aether-2026-11-21.27"
 PINNED_VERSION="${AETHER_POD_VERSION:-}"
 
 # What the image's build-time gate selected. Read for diagnostics only.
@@ -114,6 +120,49 @@ stage() {
     > "${STAGE_FILE}.tmp" 2>/dev/null && mv "${STAGE_FILE}.tmp" "$STAGE_FILE" 2>/dev/null
   log "stage: $name${detail:+ ($detail)}"
 }
+
+# ---------------------------------------------------------------------------
+# THE SUPERVISOR LOCK. Two supervisors on one pod is never a valid state: the
+# second one clears the first one's workers, starts a duplicate stack on the same
+# four ports, and the last writer of the pid files wins - which is how a pod once
+# ran two relays fighting over 8000. Ownership is a pid inside a lock directory,
+# and the lock is only taken over when its holder is provably gone.
+# ---------------------------------------------------------------------------
+LOCK_DIR="${LOG_DIR}/supervisor.lock"
+LOCK_PID="${LOCK_DIR}/pid"
+
+release_supervisor_lock() {
+  local holder
+  holder="$(cat "$LOCK_PID" 2>/dev/null || true)"
+  [ "$holder" = "$$" ] || return 0
+  rm -rf "$LOCK_DIR" 2>/dev/null || true
+}
+
+acquire_supervisor_lock() {
+  local holder
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    holder="$(cat "$LOCK_PID" 2>/dev/null || true)"
+    if [ -n "$holder" ] && [ "$holder" != "$$" ] && kill -0 "$holder" 2>/dev/null; then
+      log "supervisor lock: pid $holder already runs this pod - refusing to start a second stack"
+      return 1
+    fi
+    # The holder is gone (a killed container, a crash before the trap): stale lock.
+    log "supervisor lock: clearing a stale lock${holder:+ left by pid $holder}"
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+    mkdir "$LOCK_DIR" 2>/dev/null || { log "supervisor lock: cannot create $LOCK_DIR"; return 1; }
+  fi
+  printf '%s\n' "$$" > "$LOCK_PID" 2>/dev/null || true
+  return 0
+}
+
+if ! acquire_supervisor_lock; then
+  # Exit 0: this instance owns nothing, and a non-zero return would restart the
+  # container /start.sh is waiting on. It never touches the running stack.
+  log "supervisor lock: the existing supervisor keeps this pod; this instance exits"
+  exit 0
+fi
+trap release_supervisor_lock EXIT
+log "supervisor lock: acquired pid=$$ ($LOCK_DIR)"
 
 # ---------------------------------------------------------------------------
 # Stale Aether workers. Ownership is decided by the process's OWN COMMAND LINE,

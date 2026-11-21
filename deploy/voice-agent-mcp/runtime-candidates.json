@@ -1,0 +1,31 @@
+{
+  "generation": "0.4.1",
+  "published_tag": "0.4.1",
+  "gate": "import torch, vllm, vllm._C — all three must import in the image's interpreter",
+  "voice_gate": "import faster_whisper (the Ear) and at least one TTS engine (kokoro or chatterbox) in the same interpreter",
+  "torch_note": "vllm._C is the compiled CUDA extension, so importing it proves the wheel matches this image's torch and CUDA. No private torch symbol is gated: torch.library does not export infer_schema in torch 2.4.x and vLLM never imports it, and requiring it rejected every candidate.",
+  "torch_label_note": "The torch field is a LABEL, not a gate: the image's own torch is authoritative and the selector records what it actually imported (torch/torch_before_vllm) and warns when the label disagrees. The 2.4.0 base image ships torch 2.4.0+cu121 despite its cuda12.4.1 tag, which is what CI printed, so the label says so instead of claiming 2.4.1+cu124.",
+  "bases": [
+    {
+      "image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+      "torch": "2.4.0+cu121",
+      "torch_source": "observed: CI build 44789927889 printed torch 2.4.0+cu121 in the gate",
+      "vllm": ["0.6.3", "0.6.2", "0.6.0"]
+    },
+    {
+      "image": "runpod/pytorch:2.1.0-cu1320-torch2130-ubuntu2404",
+      "torch": "unverified",
+      "torch_source": "fallback base, never selected while the first base passes its gate",
+      "vllm": ["0.6.3", "0.6.2"]
+    }
+  ],
+  "voice": {
+    "whisper": "faster-whisper==1.1.1",
+    "transformers": "transformers==4.47.1",
+    "transformers_note": "Kokoro's warm-up failed on the transformers its TTS wheel pulled in. The in-container fix (4.47.1) only lasted as long as that container, so a fresh pod hit the same failure. The selector installs this pin AFTER the engines and re-imports the chosen engine, so the image carries the fix and proves it still loads.",
+    "tts": [
+      { "package": "kokoro>=0.9.4", "module": "kokoro" },
+      { "package": "chatterbox-tts", "module": "chatterbox" }
+    ]
+  }
+}
