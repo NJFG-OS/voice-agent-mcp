@@ -37,7 +37,8 @@ Two gates run, in this order, and the build fails if either has no passing candi
 A candidate that fails is uninstalled and the next one is tried. When every
 candidate fails the script exits non-zero, the `RUN` step fails, the image is never
 produced and nothing is published. Fail closed, by construction.
-"""import argparse
+"""
+import argparse
 import json
 import os
 import subprocess
