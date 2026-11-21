@@ -1,6 +1,6 @@
 {
-  "generation": "0.4.3",
-  "published_tag": "0.4.3",
+  "generation": "0.4.4",
+  "published_tag": "0.4.4",
   "gate": "import torch, vllm, vllm._C — all three must import in the image's interpreter",
   "voice_gate": "import faster_whisper (the Ear) and at least one TTS engine (kokoro or chatterbox) in the same interpreter",
   "torch_note": "vllm._C is the compiled CUDA extension, so importing it proves the wheel matches this image's torch and CUDA. No private torch symbol is gated: torch.library does not export infer_schema in torch 2.4.x and vLLM never imports it, and requiring it rejected every candidate.",
@@ -23,6 +23,8 @@
     "whisper": "faster-whisper==1.1.1",
     "transformers": "transformers==4.47.1",
     "transformers_note": "Kokoro's warm-up failed on the transformers its TTS wheel pulled in. The in-container fix (4.47.1) only lasted as long as that container, so a fresh pod hit the same failure. The selector installs this pin AFTER the engines and re-imports the chosen engine, so the image carries the fix and proves it still loads.",
+    "numpy": "numpy>=2.0,<2.3",
+    "numpy_note": "numpy 2.x is what pyarrow and datasets resolve against, but torch 2.4.x wheels were built against numpy 1.x, so the pin is installed LAST and then the whole stack is imported together in one interpreter: torch, vllm, vllm._C, transformers, faster-whisper, the chosen TTS engine and pyarrow/datasets when present. A pin that fails that gate is rolled back to the numpy the image already had and recorded as numpy_source=rolled_back, so a published image never carries a numpy its own runtime cannot import.",
     "tts": [
       { "package": "kokoro>=0.9.4", "module": "kokoro" },
       { "package": "chatterbox-tts", "module": "chatterbox" }

@@ -31,6 +31,13 @@
 # =============================================================================
 set -uo pipefail
 
+# The file-descriptor budget, raised before anything is started. The image bakes the
+# same value into limits.conf, /etc/profile.d and /etc/bash.bashrc, and the served
+# supervisor and the relay raise it again - but this hook is where the app's whole
+# stack is launched, so it is set here too and every child inherits it. /start.sh is
+# the provider's own entrypoint and is deliberately never rewritten.
+ulimit -n 65536 2>/dev/null || true
+
 APP="${AETHER_APP_ORIGIN:-https://deft-aether-voice-core.base44.app}"
 APP="${APP%/}"
 BAKED_ROOT="/opt/aether"
@@ -58,6 +65,7 @@ export AETHER_WEBHOOK_SECRET="$SECRET"
 
 log() { printf 'AetherVoice[post_start]: %s\n' "$*" >&2; }
 log "post-start hook /post_start.sh pid=$$ (run by the image's /start.sh)"
+log "nofile: soft=$(ulimit -Sn 2>/dev/null || echo unknown) hard=$(ulimit -Hn 2>/dev/null || echo unknown)"
 
 # -----------------------------------------------------------------------------
 # 0. Legacy volume generation. Older images wrote their scripts into

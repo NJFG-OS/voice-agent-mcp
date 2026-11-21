@@ -1,9 +1,35 @@
 # syntax=docker/dockerfile:1
 # =============================================================================
-# AetherVoice — voice-agent-mcp image  (generation 0.4.2)
+# AetherVoice — voice-agent-mcp image  (generation 0.4.4)
 #
-#   docker build -t ghcr.io/njfg-os/voice-agent-mcp:0.4.2 .
-#   docker push ghcr.io/njfg-os/voice-agent-mcp:0.4.2
+#   docker build -t ghcr.io/njfg-os/voice-agent-mcp:0.4.4 .
+#   docker push ghcr.io/njfg-os/voice-agent-mcp:0.4.4
+#
+# WHY 0.4.4 EXISTS
+#   Two things a fresh pod used to have to be fixed for by hand are now baked in.
+#   1. NUMPY IS PINNED. numpy 2.x is what pyarrow and datasets resolve against, but
+#      torch 2.4.x wheels were built against 1.x, so the pin can break the very
+#      runtime it is meant to support. select_runtime_pins.py therefore installs the
+#      manifest's numpy AFTER the engines and imports the WHOLE stack together
+#      (torch, vllm, vllm._C, transformers, faster-whisper, the chosen TTS engine and
+#      pyarrow/datasets when present). A pin that fails that gate is rolled back to
+#      the numpy the image already had and recorded in the pins, so no image is ever
+#      published with a numpy that cannot import its own runtime.
+#   2. THE FILE-DESCRIPTOR BUDGET IS BAKED. limits.conf, /etc/profile.d and
+#      /etc/bash.bashrc all carry 65536, and /post_start.sh raises it before the stack
+#      starts. A live call holds a Twilio media socket plus the relay's upstream
+#      connections; the base image's soft limit of 1024 is what a busy pod exhausted
+#      into "[Errno 24] Too many open files", taking the only public port with it.
+#   /start.sh is the provider's own and is deliberately NOT touched: the app's stack
+#   begins at /post_start.sh, so the limit is raised there and inherited by every
+#   service.
+#
+# WHY 0.4.3 EXISTS
+#   The base image's nginx config listens on 8001, the port the Ear owns. Whisper died
+#   with "OSError: [Errno 98] Address already in use" and the provider showed 8001
+#   Ready because nginx was answering there. The 8001 server block is now stripped at
+#   build time (strip_nginx_8001.py) and the result is validated, so every pod starts
+#   with the port free. Nothing else in the runtime contract changed.
 #
 # WHY 0.4.2 EXISTS
 #   The Mouth's transformers is pinned. Kokoro's warm-up failed on the transformers
@@ -86,10 +112,24 @@ ENV AETHER_APP_ORIGIN=https://deft-aether-voice-core.base44.app \
     AETHER_VLLM_PORT=8002 \
     AETHER_TTS_PORT=8080 \
     PYTHONUNBUFFERED=1 \
-    AETHER_IMAGE_VERSION=0.4.2
+    AETHER_NOFILE_TARGET=65536 \
+    AETHER_IMAGE_VERSION=0.4.4
 
 COPY runtime-candidates.json /opt/aether/runtime-candidates.json
 COPY select_runtime_pins.py /opt/aether/select_runtime_pins.py
+COPY strip_nginx_8001.py /opt/aether/strip_nginx_8001.py
+
+# THE 8001 COLLISION. The base image's /etc/nginx/nginx.conf carries a `vscode server`
+# block that listens on 8001 and proxies to localhost:8000, which is the port the Ear
+# (whisper_server.py) must own. With both on it, Whisper exited with
+# "OSError: [Errno 98] Address already in use" on every boot and the provider still
+# showed 8001 Ready, because nginx was the process answering there. The block is
+# removed from the image here, so the port is free before any pod starts; the script
+# refuses to write a config whose braces do not balance, and nginx is syntax-checked
+# when the base ships it. /post_start.sh keeps a guard for a pod whose nginx still
+# holds the port.
+RUN python3 /opt/aether/strip_nginx_8001.py \
+    && if command -v nginx >/dev/null 2>&1; then nginx -t 2>&1 | tail -n 3 || true; fi
 
 # THE CUDA DRIVER STUB — scoped to the gate steps below, never to the image.
 # A docker build has no GPU and no NVIDIA driver, so libcuda.so.1 does not exist and
@@ -138,6 +178,33 @@ RUN export LD_LIBRARY_PATH="/opt/aether/cuda-stub:${LD_LIBRARY_PATH:-}" \
 # after the engines; this step proves the pin is really the version in the image, so
 # a build that lost it fails here instead of shipping a pod that cannot speak.
 RUN python3 -c "import json, transformers; pins=json.load(open('/opt/aether/runtime-pins.json')); want=pins.get('transformers',''); assert want, 'pins name no transformers'; assert want.split('==')[-1] == transformers.__version__, 'transformers %s is not %s' % (transformers.__version__, want); print('mouth transformers ok', want)"
+
+# THE NUMPY PIN AND THE PINS FILE, proven from the finished image. The selector
+# records the numpy the image actually imports (and whether the manifest's pin was
+# kept or rolled back), so this asserts the two agree instead of trusting the log.
+RUN python3 -c "import json, numpy, torch, vllm, transformers, faster_whisper; pins=json.load(open('/opt/aether/runtime-pins.json')); want=pins.get('numpy',''); assert want, 'pins name no numpy'; assert want == numpy.__version__, 'numpy %s is not %s' % (numpy.__version__, want); print('runtime pins aligned:', json.dumps({k: pins.get(k) for k in ('torch','vllm','numpy','numpy_source','transformers','whisper','tts')}))"
+
+# THE FILE-DESCRIPTOR BUDGET, baked into the image. One live call holds a Twilio media
+# socket plus the relay's upstream connections; the base image's soft limit of 1024 is
+# what a busy pod exhausted into "[Errno 24] Too many open files", which takes the only
+# public port with it. The served supervisor, the relay and the speech worker raise it
+# again at runtime, so a container started any other way still gets the same budget.
+# /start.sh is the provider's own entrypoint and is never rewritten here.
+RUN set -eu; \
+    touch /etc/security/limits.conf; \
+    if ! grep -q 'aether-nofile' /etc/security/limits.conf; then \
+      printf '%s\n' \
+        '# aether-nofile: one call holds a media socket plus upstream connections' \
+        'root soft nofile 65536' \
+        'root hard nofile 65536' \
+        '* soft nofile 65536' \
+        '* hard nofile 65536' >> /etc/security/limits.conf; \
+    fi; \
+    printf '%s\n' 'ulimit -n 65536 2>/dev/null || true' > /etc/profile.d/aether-nofile.sh; \
+    if ! grep -q 'aether-nofile' /etc/bash.bashrc 2>/dev/null; then \
+      printf '%s\n' '# aether-nofile' 'ulimit -n 65536 2>/dev/null || true' >> /etc/bash.bashrc; \
+    fi; \
+    bash -lc 'ulimit -n' | tail -n 1
 
 # THE RELAY'S OWN DEPENDENCIES, proven at build time. voice_relay.py binds 8000 with
 # aiohttp: if that wheel is missing the relay crash-loops on import and the pod's only

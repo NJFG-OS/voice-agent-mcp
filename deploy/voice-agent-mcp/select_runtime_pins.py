@@ -61,6 +61,36 @@ TRANSFORMERS_GATE = (
     "print(transformers.__version__)\n"
 )
 
+NUMPY_GATE = (
+    "import numpy\n"
+    "print(numpy.__version__)\n"
+)
+
+
+def stack_gate_source(module):
+    """Everything that shares this numpy, imported together in one interpreter.
+
+    A numpy pin is only safe when the WHOLE stack still imports with it: torch 2.4.x
+    wheels were built against numpy 1.x, and vLLM, transformers, faster-whisper and
+    the TTS engine all share the same array ABI. pyarrow and datasets are imported
+    too when the image carries them, because those are the packages that need 2.x -
+    gating them keeps the training pod's imports from breaking on a later boot.
+    """
+    lines = [
+        "import importlib",
+        "import importlib.util",
+        "import numpy, torch, vllm, vllm._C, transformers, faster_whisper",
+    ]
+    if module:
+        lines.append("importlib.import_module(%r)" % module)
+    lines.extend([
+        "for _name in ('pyarrow', 'datasets'):",
+        "    if importlib.util.find_spec(_name) is not None:",
+        "        importlib.import_module(_name)",
+        "print(numpy.__version__, torch.__version__, vllm.__version__, transformers.__version__)",
+    ])
+    return "\n".join(lines) + "\n"
+
 INSTALL_TIMEOUT = 3600
 GATE_TIMEOUT = 900
 
@@ -150,7 +180,9 @@ def install_voice(pins, voice):
         pins["tts_module"] = module
         pins["tts_version"] = out.splitlines()[-1].strip() if out else "unknown"
         pins["tts_rejected"] = rejected
-        return pin_transformers(pins, voice)
+        if pin_transformers(pins, voice) != 0:
+            return 1
+        return pin_numpy(pins, voice)
 
     pins["tts_rejected"] = rejected
     print("select_runtime_pins: no TTS engine passed the import gate", file=sys.stderr)
@@ -198,6 +230,82 @@ def pin_transformers(pins, voice):
                 file=sys.stderr,
             )
             return 1
+    return 0
+
+
+def installed_numpy():
+    """The numpy version this image already imports, or "" when it has none."""
+    code, out, _ = run([sys.executable, "-c", NUMPY_GATE], timeout=300)
+    return out.splitlines()[-1].strip() if code == 0 and out else ""
+
+
+def pin_numpy(pins, voice):
+    """The one pin that can break torch, vLLM, transformers and training at once.
+
+    numpy 2.x is what pyarrow and datasets resolve against, while torch 2.4.x wheels
+    were built against 1.x. So the pin is installed LAST, after the engines and their
+    transformers, and then the whole stack is imported together. A pin that fails
+    that gate is rolled back to the numpy the image already had, which is recorded -
+    the build only fails when even the rollback cannot import the stack, because that
+    means the image is broken whatever the pin says.
+    """
+    package = str((voice or {}).get("numpy") or "").strip()
+    if not package:
+        return 0
+    module = str(pins.get("tts_module") or "")
+    before = installed_numpy()
+    print("select_runtime_pins: installing %s (image has %s)" % (package, before or "none"))
+
+    code, out, err = run([sys.executable, "-m", "pip", "install", "--no-cache-dir", package])
+    if code != 0:
+        print(
+            "select_runtime_pins: %s failed to install: %s" % (package, (err or out)[-800:]),
+            file=sys.stderr,
+        )
+        return 1
+
+    code, out, err = run([sys.executable, "-c", stack_gate_source(module)], timeout=GATE_TIMEOUT)
+    if code == 0:
+        fields = out.split()
+        pins["numpy"] = fields[0] if fields else package
+        pins["numpy_source"] = "pinned"
+        pins["numpy_stack"] = out.strip()
+        print("select_runtime_pins: numpy %s holds the whole stack (%s)" % (pins["numpy"], out.strip()))
+        return 0
+
+    detail = (err or out)[-1200:]
+    print(
+        "select_runtime_pins: %s broke the stack import - rolling back: %s" % (package, detail),
+        file=sys.stderr,
+    )
+
+    restore = ("numpy==" + before) if before else "numpy<2"
+    code, out, err = run([sys.executable, "-m", "pip", "install", "--no-cache-dir", restore])
+    if code != 0:
+        print(
+            "select_runtime_pins: could not restore %s: %s" % (restore, (err or out)[-800:]),
+            file=sys.stderr,
+        )
+        return 1
+
+    code, out, err = run([sys.executable, "-c", stack_gate_source(module)], timeout=GATE_TIMEOUT)
+    if code != 0:
+        print(
+            "select_runtime_pins: the image's own numpy no longer imports the stack: %s" % ((err or out)[-800:]),
+            file=sys.stderr,
+        )
+        return 1
+
+    fields = out.split()
+    pins["numpy"] = fields[0] if fields else before or "unknown"
+    pins["numpy_source"] = "rolled_back"
+    pins["numpy_rejected"] = {"pin": package, "detail": detail}
+    pins["numpy_stack"] = out.strip()
+    print(
+        "select_runtime_pins: kept numpy %s (%s) - the pin %s cannot import this runtime"
+        % (pins["numpy"], pins["numpy_source"], package),
+        file=sys.stderr,
+    )
     return 0
 
 
