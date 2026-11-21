@@ -28,6 +28,7 @@ on:
       - post_start.sh
       - runtime-candidates.json
       - select_runtime_pins.py
+      - strip_nginx_8001.py
       - .github/workflows/docker-image.yml
 
 permissions:

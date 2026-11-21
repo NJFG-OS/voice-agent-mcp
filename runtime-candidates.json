@@ -1,6 +1,6 @@
 {
-  "generation": "0.4.2",
-  "published_tag": "0.4.2",
+  "generation": "0.4.3",
+  "published_tag": "0.4.3",
   "gate": "import torch, vllm, vllm._C — all three must import in the image's interpreter",
   "voice_gate": "import faster_whisper (the Ear) and at least one TTS engine (kokoro or chatterbox) in the same interpreter",
   "torch_note": "vllm._C is the compiled CUDA extension, so importing it proves the wheel matches this image's torch and CUDA. No private torch symbol is gated: torch.library does not export infer_schema in torch 2.4.x and vLLM never imports it, and requiring it rejected every candidate.",

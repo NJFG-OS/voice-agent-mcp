@@ -223,6 +223,39 @@ clear_owned_workers() {
   log "stopped previous-container worker(s): $(printf '%s' "$pids" | tr '\n' ' ')"
 }
 
+# Whisper (the Ear) owns 8001. The image strips the base config's 8001 listener at
+# build time, so this only acts on a pod whose nginx still holds the port: whisper
+# would otherwise exit with "Address already in use" while the provider kept showing
+# 8001 Ready, because nginx - not Whisper - was the process answering there.
+port_8001_free() {
+  "${PY:-python3}" -c 'import socket, sys
+sock = socket.socket()
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    sock.bind(("0.0.0.0", 8001))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()' 2>/dev/null
+}
+
+ensure_port_8001_free() {
+  if port_8001_free; then
+    log "port 8001: free for Whisper"
+    return 0
+  fi
+  log "port 8001: already bound - stopping nginx so Whisper (the Ear) can own it"
+  if command -v nginx >/dev/null 2>&1; then
+    nginx -s stop 2>/dev/null || pkill -x nginx 2>/dev/null || true
+    sleep 2
+  fi
+  if port_8001_free; then
+    log "port 8001: released for Whisper"
+  else
+    log "port 8001: still bound by another process - whisper reports the failure in its own log"
+  fi
+}
+
 bootstrap_workspace() {
   local dir port pid name
   for dir in "$HF_HOME" "$PIP_CACHE_DIR" "$AETHER_VOICE_DIR" \
@@ -243,6 +276,7 @@ bootstrap_workspace() {
   # by command line. A port-wide kill would also take down a listener that merely
   # happens to sit on 8000-8080 and is not this app's.
   clear_owned_workers
+  ensure_port_8001_free
 
   date -u +%FT%TZ > "${WORKSPACE_DIR}/.aether-last-boot" 2>/dev/null || true
   log "workspace bootstrap: caches repaired, stale workers cleared (8000/8001/8002/8080)"

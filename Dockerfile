@@ -1,9 +1,16 @@
 # syntax=docker/dockerfile:1
 # =============================================================================
-# AetherVoice — voice-agent-mcp image  (generation 0.4.2)
+# AetherVoice — voice-agent-mcp image  (generation 0.4.3)
 #
-#   docker build -t ghcr.io/njfg-os/voice-agent-mcp:0.4.2 .
-#   docker push ghcr.io/njfg-os/voice-agent-mcp:0.4.2
+#   docker build -t ghcr.io/njfg-os/voice-agent-mcp:0.4.3 .
+#   docker push ghcr.io/njfg-os/voice-agent-mcp:0.4.3
+#
+# WHY 0.4.3 EXISTS
+#   The base image's nginx config listens on 8001, the port the Ear owns. Whisper died
+#   with "OSError: [Errno 98] Address already in use" and the provider showed 8001
+#   Ready because nginx was answering there. The 8001 server block is now stripped at
+#   build time (strip_nginx_8001.py) and the result is validated, so every pod starts
+#   with the port free. Nothing else in the runtime contract changed.
 #
 # WHY 0.4.2 EXISTS
 #   The Mouth's transformers is pinned. Kokoro's warm-up failed on the transformers
@@ -86,10 +93,23 @@ ENV AETHER_APP_ORIGIN=https://deft-aether-voice-core.base44.app \
     AETHER_VLLM_PORT=8002 \
     AETHER_TTS_PORT=8080 \
     PYTHONUNBUFFERED=1 \
-    AETHER_IMAGE_VERSION=0.4.2
+    AETHER_IMAGE_VERSION=0.4.3
 
 COPY runtime-candidates.json /opt/aether/runtime-candidates.json
 COPY select_runtime_pins.py /opt/aether/select_runtime_pins.py
+COPY strip_nginx_8001.py /opt/aether/strip_nginx_8001.py
+
+# THE 8001 COLLISION. The base image's /etc/nginx/nginx.conf carries a `vscode server`
+# block that listens on 8001 and proxies to localhost:8000, which is the port the Ear
+# (whisper_server.py) must own. With both on it, Whisper exited with
+# "OSError: [Errno 98] Address already in use" on every boot and the provider still
+# showed 8001 Ready, because nginx was the process answering there. The block is
+# removed from the image here, so the port is free before any pod starts; the script
+# refuses to write a config whose braces do not balance, and nginx is syntax-checked
+# when the base ships it. /post_start.sh keeps a guard for a pod whose nginx still
+# holds the port.
+RUN python3 /opt/aether/strip_nginx_8001.py \
+    && if command -v nginx >/dev/null 2>&1; then nginx -t 2>&1 | tail -n 3 || true; fi
 
 # THE CUDA DRIVER STUB — scoped to the gate steps below, never to the image.
 # A docker build has no GPU and no NVIDIA driver, so libcuda.so.1 does not exist and
