@@ -52,8 +52,10 @@
 #     (kokoro, or chatterbox as the fallback) are installed and import-gated in the
 #     same build step as vLLM. A pod can no longer boot with tts:false in its own
 #     health contract, and no pod installs a runtime at boot.
-#   * Port contract is explicit: relay 8000 (public), whisper 8001, vllm 8002 and
-#     tts 8080 all loopback. The stale CosyVoice :5000 assumption is gone.
+#   * Port contract is explicit: relay 8000, whisper 8001, vllm 8002 and tts 8080,
+#     every one bound on 0.0.0.0 because the provider's proxy connects to the pod's
+#     own interface and never to loopback. The stale CosyVoice :5000 assumption is
+#     gone. AETHER_WHISPER_HOST / AETHER_VLLM_HOST=127.0.0.1 closes either port again.
 #
 # WHAT CHANGED FROM 0.2.x
 #   * The base is the official RunPod PyTorch image again, so /start.sh, sshd and
@@ -111,6 +113,8 @@ ENV AETHER_APP_ORIGIN=https://deft-aether-voice-core.base44.app \
     AETHER_WHISPER_PORT=8001 \
     AETHER_VLLM_PORT=8002 \
     AETHER_TTS_PORT=8080 \
+    AETHER_WHISPER_HOST=0.0.0.0 \
+    AETHER_VLLM_HOST=0.0.0.0 \
     PYTHONUNBUFFERED=1 \
     AETHER_NOFILE_TARGET=65536 \
     AETHER_IMAGE_VERSION=0.4.4

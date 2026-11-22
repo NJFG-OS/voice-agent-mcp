@@ -231,24 +231,26 @@ clear_owned_workers() {
   log "stopped previous-container worker(s): $(printf '%s' "$pids" | tr '\n' ' ')"
 }
 
-# Whisper (the Ear) owns 8001. The image strips the base config's 8001 listener at
-# build time, so this only acts on a pod whose nginx still holds the port: whisper
-# would otherwise exit with "Address already in use" while the provider kept showing
-# 8001 Ready, because nginx - not Whisper - was the process answering there.
-port_8001_free() {
+# Whisper (the Ear) owns 8001 and vLLM (the Brain) owns 8002, and both are declared
+# HTTP ports on the template, so both must be free before the stack starts. The image
+# strips the base config's 8001 listener at build time, so the 8001 guard only acts on
+# a pod whose nginx still holds the port: whisper would otherwise exit with "Address
+# already in use" while the provider kept showing 8001 Ready, because nginx - not
+# Whisper - was the process answering there.
+port_free() {  # $1 = port
   "${PY:-python3}" -c 'import socket, sys
 sock = socket.socket()
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
-    sock.bind(("0.0.0.0", 8001))
+    sock.bind(("0.0.0.0", int(sys.argv[1])))
 except OSError:
     sys.exit(1)
 finally:
-    sock.close()' 2>/dev/null
+    sock.close()' "$1" 2>/dev/null
 }
 
 ensure_port_8001_free() {
-  if port_8001_free; then
+  if port_free 8001; then
     log "port 8001: free for Whisper"
     return 0
   fi
@@ -257,11 +259,21 @@ ensure_port_8001_free() {
     nginx -s stop 2>/dev/null || pkill -x nginx 2>/dev/null || true
     sleep 2
   fi
-  if port_8001_free; then
+  if port_free 8001; then
     log "port 8001: released for Whisper"
   else
     log "port 8001: still bound by another process - whisper reports the failure in its own log"
   fi
+}
+
+# 8002 is vLLM's. Nothing in the base image listens there, so a bind means a worker
+# this container did not start; it is reported, never killed blindly.
+ensure_port_8002_free() {
+  if port_free 8002; then
+    log "port 8002: free for vLLM"
+    return 0
+  fi
+  log "port 8002: still bound after stale-worker cleanup - the vLLM launcher reports it in vllm.log"
 }
 
 bootstrap_workspace() {
@@ -270,8 +282,12 @@ bootstrap_workspace() {
              "${WORKSPACE_DIR}/logs" "${WORKSPACE_DIR}/tts_voices" \
              "${WORKSPACE_DIR}/tenants" "${WORKSPACE_DIR}/platform"; do
     mkdir -p "$dir" 2>/dev/null || log "warning: cannot create $dir"
-    # A directory owned by another uid is why a later write failed silently.
-    [ -w "$dir" ] || chmod -R u+rwX "$dir" 2>/dev/null || true
+    # /workspace is owned by nobody:nogroup on the provider's volume, where chmod and
+    # chown both answer "Operation not permitted" and only add a failing command to
+    # the boot. Ownership is never changed here: a directory this container cannot
+    # write is reported, and the stack keeps its logs on the container disk instead
+    # (start_all.sh falls back to /tmp/aether-logs).
+    [ -w "$dir" ] || log "warning: $dir is not writable by this container - caches stay read-only"
   done
 
   # Half-written downloads are never resumable across a pod, and a stale one blocks
@@ -285,6 +301,7 @@ bootstrap_workspace() {
   # happens to sit on 8000-8080 and is not this app's.
   clear_owned_workers
   ensure_port_8001_free
+  ensure_port_8002_free
 
   date -u +%FT%TZ > "${WORKSPACE_DIR}/.aether-last-boot" 2>/dev/null || true
   log "workspace bootstrap: caches repaired, stale workers cleared (8000/8001/8002/8080)"

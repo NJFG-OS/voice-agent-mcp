@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """AetherVoice vLLM launcher - image torch and vLLM, profile sized to the GPU."""
+import glob
 import json
 import os
 import re
@@ -97,6 +98,12 @@ def resolve_model():
 
 # MODEL is resolved below, once stamp() exists: the probe writes a stage record.
 PORT = os.environ.get("AETHER_VLLM_PORT", "8002")
+# 8002 is a template-declared port, so the provider's proxy dials the pod's own
+# interface and a loopback bind leaves <pod>-8002.proxy.runpod.net unable to connect.
+# The relay keeps reaching the engine on 127.0.0.1 either way.
+# AETHER_VLLM_HOST=127.0.0.1 closes the public engine and leaves the relay as the
+# only way in.
+HOST = os.environ.get("AETHER_VLLM_HOST", "0.0.0.0")
 HF_HOME = os.environ.get("HF_HOME", "/workspace/hf-cache")
 # The 24GB profile. Stated, not derived: a smaller context and four sequences leave
 # the rest of the card for Whisper and the speech engine, which share it.
@@ -157,6 +164,175 @@ def write_mode(mode, detail, adapter=""):
     except Exception as error:
         print("run_vllm_safe: mode file not written (" + str(error)[:120] + ")", flush=True)
     print("run_vllm_safe: mode=" + mode + " detail=" + (detail or "none"), flush=True)
+
+
+def hf_cache_dir(repo_id):
+    """This model's own cache folder - the only one the launcher ever touches."""
+    owner, _, name = repo_id.partition("/")
+    return os.path.join(HF_HOME, "hub", "models--" + owner + "--" + (name or owner))
+
+
+def snapshot_dirs(repo_id):
+    return sorted(glob.glob(os.path.join(hf_cache_dir(repo_id), "snapshots", "*")))
+
+
+def cache_problem(repo_id):
+    """What is wrong with the cached snapshot of this model, or "" when it is usable.
+
+    Only local evidence is checked, before vLLM starts: the config it parses first
+    and the weight files it maps. A 0-byte config left by an interrupted download is
+    what made the engine die in json.load with "Expecting value: line 1 column 1
+    (char 0)" on every later boot, because the hub keeps serving it as a cache hit.
+    """
+    folders = snapshot_dirs(repo_id)
+    if not folders:
+        return "cold_cache"
+    problems = []
+    for folder in folders:
+        config = os.path.join(folder, "config.json")
+        if not os.path.isfile(config):
+            problems.append("missing_config")
+            continue
+        try:
+            size = os.path.getsize(config)
+        except Exception:
+            size = 0
+        if size < 2:
+            problems.append("empty_config")
+            continue
+        try:
+            with open(config) as handle:
+                data = json.load(handle)
+        except Exception:
+            problems.append("unreadable_config")
+            continue
+        if not isinstance(data, dict) or not data:
+            problems.append("empty_config_object")
+            continue
+        try:
+            names = sorted(os.listdir(folder))
+        except Exception:
+            problems.append("unreadable_snapshot")
+            continue
+        weights = [n for n in names if n.endswith(".safetensors") or n.endswith(".bin")]
+        if not weights:
+            problems.append("no_weights")
+            continue
+        for name in weights:
+            try:
+                if os.path.getsize(os.path.join(folder, name)) < 1024:
+                    problems.append("empty_weights")
+                    break
+            except Exception:
+                problems.append("unreadable_weights")
+                break
+    return "" if not problems else ",".join(sorted(set(problems)))
+
+
+def repair_cache(repo_id, problem):
+    """Drop ONLY the artifacts the problem names, so a warm cache is never thrown away.
+
+    A missing or empty config is removed and re-fetched; a bad weight file is removed
+    with its snapshot link so the next load downloads it again. Nothing outside this
+    model's own snapshot folders is ever touched.
+    """
+    removed = 0
+    for folder in snapshot_dirs(repo_id):
+        try:
+            names = sorted(os.listdir(folder))
+        except Exception:
+            continue
+        for name in names:
+            path = os.path.join(folder, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                size = os.path.getsize(path)
+            except Exception:
+                size = 0
+            drop = False
+            if name == "config.json" and "config" in problem:
+                drop = True
+            elif name.endswith(".json") and size == 0:
+                drop = True
+            elif (name.endswith(".safetensors") or name.endswith(".bin")) and (size < 1024 or "weights" in problem):
+                drop = True
+            if not drop:
+                continue
+            target = os.path.realpath(path) if os.path.islink(path) else ""
+            for candidate in (path, target):
+                if not candidate:
+                    continue
+                try:
+                    os.remove(candidate)
+                    removed += 1
+                except Exception:
+                    pass
+    return removed
+
+
+def fetch_config(repo_id):
+    """Re-fetch config.json when the cache cannot supply one, with the pod's token."""
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+    try:
+        from huggingface_hub import hf_hub_download
+    except Exception:
+        return ""
+    try:
+        hf_hub_download(repo_id=repo_id, filename="config.json", token=token or None)
+        return ""
+    except Exception as error:
+        return "config.json download failed: " + str(error)[:140]
+
+
+def prepare_model_cache(repo_id):
+    """Validate (and repair) this model's cached snapshot before vLLM reads it."""
+    problem = cache_problem(repo_id)
+    if not problem:
+        print("run_vllm_safe: model cache ok for " + repo_id + " (" + hf_cache_dir(repo_id) + ")", flush=True)
+        return ""
+    print("run_vllm_safe: model cache problem for " + repo_id + ": " + problem, flush=True)
+    if problem == "cold_cache":
+        print("run_vllm_safe: no snapshot yet - vLLM downloads the weights on this boot", flush=True)
+        return problem
+    removed = repair_cache(repo_id, problem)
+    print("run_vllm_safe: dropped " + str(removed) + " cached artifact(s); vLLM downloads them again", flush=True)
+    if "config" in problem:
+        note = fetch_config(repo_id)
+        if note:
+            print("run_vllm_safe: " + note, flush=True)
+    return problem
+
+
+def enable_safetensors_prefetch(env):
+    """Turn on the prefetch weight loader, but only on a vLLM that reads the flag.
+
+    Setting an env var the installed vLLM never reads is a silent no-op, so the flag
+    is looked for in the engine's own sources first and left alone when absent.
+    """
+    try:
+        import vllm
+    except Exception:
+        return ""
+    root = os.path.dirname(vllm.__file__)
+    paths = [os.path.join(root, "envs.py")]
+    for base, _dirs, files in os.walk(root):
+        for name in files:
+            if name.endswith(".py") and "weight_utils" in name:
+                paths.append(os.path.join(base, name))
+    for path in paths:
+        try:
+            with open(path, errors="replace") as handle:
+                text = handle.read()
+        except Exception:
+            continue
+        for key in ("VLLM_SAFETENSORS_LOAD_STRATEGY", "SAFETENSORS_LOAD_STRATEGY"):
+            if key in text:
+                env[key] = "prefetch"
+                print("run_vllm_safe: " + key + "=prefetch (this vLLM supports it)", flush=True)
+                return key
+    print("run_vllm_safe: this vLLM has no safetensors load strategy flag - default loader", flush=True)
+    return ""
 
 
 def adapter_problem(path):
@@ -230,7 +406,7 @@ def neutralise_deep_gemm():
 def build_cmd(extra):
     return [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-        "--host", "0.0.0.0",
+        "--host", HOST,
         "--model", MODEL,
         "--port", str(PORT),
         "--gpu-memory-utilization", GPU_UTIL,
@@ -335,6 +511,9 @@ def main():
     # The mandatory torch.compile fix: no dynamo, no inductor, so the duplicate
     # template name crash cannot occur.
     env.setdefault("TORCHDYNAMO_DISABLE", "1")
+    # A cold load reads ~16GB of safetensors; prefetch overlaps that with the
+    # allocation instead of serialising it, where the engine supports it.
+    enable_safetensors_prefetch(env)
 
     print(
         "run_vllm_safe: vram=%.1fGB (%dMiB) gpu_util=%s max_model_len=%d max_seqs=%d deep_gemm=%s python=%s"
@@ -342,6 +521,11 @@ def main():
         flush=True,
     )
     print("run_vllm_safe: pythonpath=" + (os.environ.get("PYTHONPATH") or "none"), flush=True)
+
+    # The cached snapshot is checked (and repaired) before the engine reads it: a
+    # 0-byte config left by an interrupted download is a json.load crash on every
+    # later boot, and the engine's own traceback never names the file.
+    prepare_model_cache(MODEL)
 
     lora, adapter, problem = lora_flags()
     if not lora:

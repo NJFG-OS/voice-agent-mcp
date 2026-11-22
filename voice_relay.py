@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """AetherVoice voice relay - the ONE public port.
 
-Binds 0.0.0.0:8000 and nothing else. vLLM answers on 8002, TTS on 8080 (loopback).
+Binds 0.0.0.0:8000. vLLM answers on 8002, TTS on 8080 (published for the provider's
+port probe and pod-secret gated; normally reached as <relay>/tts/*).
 Every Twilio stream gets its OWN session context, resolved from
 that stream's custom parameters (workspace_id + agent_id), so two concurrent
 calls never share an agent, a transcript, a tool set or a speech buffer.
@@ -14,11 +15,12 @@ import io
 import json
 import os
 import re
+import resource
 import sys
 import time
 import wave
 
-from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
+from aiohttp import ClientSession, ClientTimeout, TCPConnector, WSMsgType, web
 
 HOST = "0.0.0.0"
 PORT = 8000
@@ -31,6 +33,68 @@ LOG_DIR = os.environ.get("AETHER_LOG_DIR", "/workspace/aether/logs")
 SERVED = os.environ.get("AETHER_SERVED_MODEL", "").strip()
 MODELS_TRIED_RAW = os.environ.get("AETHER_MODELS_TRIED", "").strip()
 BOOTED = time.time()
+
+# The file-descriptor budget this process must own. A live call holds a Twilio media
+# socket plus the relay's upstream connections, and the image's soft default (1024)
+# is exhausted by a handful of concurrent calls - which surfaced as
+# "[Errno 24] Too many open files" and took the only public port with it. The
+# supervisor raises the limit for its children; this raises it again here, so a relay
+# started any other way (a manual run, a self-refresh) still has the same target.
+NOFILE_TARGET = int(os.environ.get("AETHER_NOFILE_TARGET") or 65536)
+
+
+def raise_nofile():
+    """Best effort: the soft limit goes up to the target, never above the hard one."""
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except Exception:
+        return "unavailable"
+    want = NOFILE_TARGET if hard in (resource.RLIM_INFINITY, -1) else min(NOFILE_TARGET, hard)
+    if soft >= want:
+        return str(soft)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+        return str(want)
+    except Exception:
+        return str(soft)
+
+
+NOFILE = raise_nofile()
+
+# ONE pooled HTTP session for the relay's whole life.
+#
+# Every health poll and every proxy call used to build its own ClientSession, and each
+# one left a connector, a socket and a resolver entry behind. Under the app's polling
+# that reached the pod's file-descriptor budget and the relay died with
+# "[Errno 24] Too many open files" - taking the only public port with it. The session
+# is created once, inside the running loop, and reused; a per-call deadline is passed
+# on the request instead of on the session.
+SESSION = {"client": None}
+
+
+def session():
+    """The shared session, created on first use inside the running loop."""
+    client = SESSION["client"]
+    if client is None or client.closed:
+        client = ClientSession(
+            connector=TCPConnector(
+                limit=64,
+                limit_per_host=16,
+                ttl_dns_cache=300,
+                enable_cleanup_closed=True,
+            ),
+            timeout=ClientTimeout(total=30),
+            trust_env=False,
+        )
+        SESSION["client"] = client
+    return client
+
+
+async def close_session():
+    client = SESSION["client"]
+    SESSION["client"] = None
+    if client is not None and not client.closed:
+        await client.close()
 
 # tenant -> (pointer mtime, model id). The pointer file is re-read only when it
 # changes, so a promotion is picked up on the next turn without a restart.
@@ -119,10 +183,18 @@ def _runtime_pins():
             data = json.load(handle)
     except Exception:
         return {}
+    # The whole runtime the image gated, not just the Brain: /health is the one place
+    # an operator can prove which numpy/torch/transformers/whisper/tts a pod really
+    # runs, so a pin that drifted is visible without a shell.
     return {
         "torch": data.get("torch", ""),
         "vllm": data.get("vllm", ""),
         "base_image": data.get("base_image", ""),
+        "numpy": data.get("numpy", ""),
+        "numpy_source": data.get("numpy_source", ""),
+        "transformers": data.get("transformers", ""),
+        "whisper": data.get("whisper", ""),
+        "tts": data.get("tts", ""),
     }
 
 
@@ -161,9 +233,8 @@ def _tail(path, lines):
 
 async def _code(url, total=2.0):
     try:
-        async with ClientSession(timeout=ClientTimeout(total=total)) as session:
-            async with session.get(url) as response:
-                return response.status
+        async with session().get(url, timeout=ClientTimeout(total=total)) as response:
+            return response.status
     except Exception:
         return 0
 
@@ -171,13 +242,12 @@ async def _code(url, total=2.0):
 async def _vllm_state():
     """loading vs ready: vLLM only answers /v1/models once weights are in VRAM."""
     try:
-        async with ClientSession(timeout=ClientTimeout(total=2.0)) as session:
-            async with session.get(VLLM + "/v1/models") as response:
-                if response.status != 200:
-                    return "loading", []
-                data = await response.json()
-                ids = [row.get("id") for row in (data.get("data") or []) if row.get("id")]
-                return ("ready" if ids else "loading"), ids
+        async with session().get(VLLM + "/v1/models", timeout=ClientTimeout(total=2.0)) as response:
+            if response.status != 200:
+                return "loading", []
+            data = await response.json()
+            ids = [row.get("id") for row in (data.get("data") or []) if row.get("id")]
+            return ("ready" if ids else "loading"), ids
     except Exception:
         return "loading", []
 
@@ -185,11 +255,10 @@ async def _vllm_state():
 async def _whisper_state():
     """200 means the worker is up; ready means its model has finished loading."""
     try:
-        async with ClientSession(timeout=ClientTimeout(total=2.0)) as session:
-            async with session.get(WHISPER + "/health") as response:
-                if response.status != 200:
-                    return {"ok": False, "ready": False, "engine": "none"}
-                return await response.json()
+        async with session().get(WHISPER + "/health", timeout=ClientTimeout(total=2.0)) as response:
+            if response.status != 200:
+                return {"ok": False, "ready": False, "engine": "none"}
+            return await response.json()
     except Exception:
         return {"ok": False, "ready": False, "engine": "none"}
 
@@ -246,6 +315,7 @@ async def health(_request):
         "sessions": len(SESSIONS),
         "workspaces_armed": len(CONFIGS),
         "stage": _boot_stage(),
+        "nofile": NOFILE,
         "bind": HOST + ":" + str(PORT),
     })
 
@@ -253,14 +323,13 @@ async def health(_request):
 async def forward_get(request):
     path = request.path_qs
     try:
-        async with ClientSession(timeout=ClientTimeout(total=60)) as session:
-            async with session.get(VLLM + path) as response:
-                body = await response.read()
-                return web.Response(
-                    body=body,
-                    status=response.status,
-                    content_type=response.content_type or "application/json",
-                )
+        async with session().get(VLLM + path, timeout=ClientTimeout(total=60)) as response:
+            body = await response.read()
+            return web.Response(
+                body=body,
+                status=response.status,
+                content_type=response.content_type or "application/json",
+            )
     except Exception as error:
         return web.json_response({"error": "vllm_unreachable", "detail": str(error)}, status=502)
 
@@ -281,50 +350,57 @@ async def forward_post(request):
             except Exception:
                 pass
     try:
-        async with ClientSession(timeout=ClientTimeout(total=180)) as session:
-            async with session.post(
-                VLLM + path, data=raw, headers={"content-type": request.headers.get("content-type", "application/json")}
-            ) as response:
-                body = await response.read()
-                return web.Response(
-                    body=body,
-                    status=response.status,
-                    content_type=response.content_type or "application/json",
-                )
+        async with session().post(
+            VLLM + path,
+            data=raw,
+            headers={"content-type": request.headers.get("content-type", "application/json")},
+            timeout=ClientTimeout(total=180),
+        ) as response:
+            body = await response.read()
+            return web.Response(
+                body=body,
+                status=response.status,
+                content_type=response.content_type or "application/json",
+            )
     except Exception as error:
         return web.json_response({"error": "vllm_unreachable", "detail": str(error)}, status=502)
 
 
 async def forward_tts(request):
-    """The app reaches the loopback speech worker through this one public port.
+    """The app reaches the speech worker through this one public port.
 
-    Voice catalog, previews and saved clips all live on 8080, which is loopback
-    only. Proxying them here keeps a single public port and no extra exposure.
+    Voice catalog, previews and saved clips all live on 8080, which the provider
+    probes directly but only answers beyond /health to a caller holding the pod
+    secret. Proxying them here keeps the app on a single public port.
     """
     path = request.path_qs
     target = TTS + (path[len("/tts"):] if path.startswith("/tts") else path)
     try:
-        async with ClientSession(timeout=ClientTimeout(total=90)) as session:
-            if request.method == "GET":
-                async with session.get(target) as response:
-                    body = await response.read()
-                    return web.Response(
-                        body=body,
-                        status=response.status,
-                        content_type=response.content_type or "application/json",
-                    )
-            raw = await request.read()
-            async with session.post(
-                target,
-                data=raw,
-                headers={"content-type": request.headers.get("content-type", "application/json")},
-            ) as response:
+        if request.method == "GET":
+            async with session().get(target, timeout=ClientTimeout(total=90)) as response:
                 body = await response.read()
                 return web.Response(
                     body=body,
                     status=response.status,
                     content_type=response.content_type or "application/json",
                 )
+        raw = await request.read()
+        async with session().post(
+            target,
+            data=raw,
+            headers={"content-type": request.headers.get("content-type", "application/json")},
+            timeout=ClientTimeout(total=90),
+        ) as response:
+            body = await response.read()
+            # A saved clip spoken in a preset voice is reported by the worker as
+            # X-Aether-Voice; it is passed through so the app can tell the two apart.
+            note = response.headers.get("X-Aether-Voice")
+            return web.Response(
+                body=body,
+                status=response.status,
+                content_type=response.content_type or "application/json",
+                headers={"X-Aether-Voice": note} if note else None,
+            )
     except Exception as error:
         return web.json_response({"error": "tts_unreachable", "detail": str(error)[:200]}, status=502)
 
@@ -367,8 +443,9 @@ async def session_end(request):
     except Exception:
         payload = {}
     workspace_id = str(payload.get("workspace_id") or "")
-    for sid, session in list(SESSIONS.items()):
-        if not workspace_id or session.workspace_id == workspace_id:
+    # Named state, never "session": that name is the relay's shared HTTP session.
+    for sid, state in list(SESSIONS.items()):
+        if not workspace_id or state.workspace_id == workspace_id:
             SESSIONS.pop(sid, None)
     if workspace_id:
         CONFIGS.pop(workspace_id, None)
@@ -416,11 +493,12 @@ async def app_json(path, payload=None, method="POST", timeout=20):
         kwargs["json"] = payload
         headers["content-type"] = "application/json"
     try:
-        async with ClientSession(timeout=ClientTimeout(total=timeout)) as session:
-            async with session.request(method, APP + path, headers=headers, **kwargs) as response:
-                if response.status != 200:
-                    return None
-                return await response.json()
+        async with session().request(
+            method, APP + path, headers=headers, timeout=ClientTimeout(total=timeout), **kwargs
+        ) as response:
+            if response.status != 200:
+                return None
+            return await response.json()
     except Exception:
         return None
 
@@ -444,11 +522,12 @@ async def tts_wav(text, voice, tone):
         return None
     body = {"text": text, "voice": voice or "", "tone": tone or ""}
     try:
-        async with ClientSession(timeout=ClientTimeout(total=45)) as session:
-            async with session.post(TTS + "/synthesize", json=body) as response:
-                if response.status != 200:
-                    return None
-                return await response.read()
+        async with session().post(
+            TTS + "/synthesize", json=body, timeout=ClientTimeout(total=45)
+        ) as response:
+            if response.status != 200:
+                return None
+            return await response.read()
     except Exception:
         return None
 
@@ -458,11 +537,12 @@ async def vllm_chat(body):
     if target:
         body["model"] = target
     try:
-        async with ClientSession(timeout=ClientTimeout(total=90)) as session:
-            async with session.post(VLLM + "/v1/chat/completions", json=body) as response:
-                if response.status != 200:
-                    return None
-                return await response.json()
+        async with session().post(
+            VLLM + "/v1/chat/completions", json=body, timeout=ClientTimeout(total=90)
+        ) as response:
+            if response.status != 200:
+                return None
+            return await response.json()
     except Exception:
         return None
 
@@ -533,7 +613,11 @@ class Session:
         if self.turn_note:
             parts.append("Active workflow step: " + self.turn_note)
         parts.append("You are on a live phone call. Reply in one or two short spoken sentences, plain text, no markdown.")
-        return "\\n".join(parts)
+        # The transcript is the only record of what the caller already said, so it is
+        # named here: re-asking a captured detail is the most common wasted turn, and
+        # every wasted turn is a second of silence on a live call.
+        parts.append("Never ask again for anything the caller has already told you in this call - use what they said.")
+        return "\n".join(parts)
 
     # ---- caller audio in ----
     async def feed(self, ws, payload):
@@ -666,7 +750,9 @@ class Session:
         for _ in range(3):
             body = {
                 "messages": [{"role": "system", "content": self.system_prompt()}] + self.history[-12:],
-                "max_tokens": 300,
+                # Spoken turns are short by contract: a smaller cap is a shorter wait
+                # before the first syllable, and the reply is trimmed by the prompt.
+                "max_tokens": 220,
             }
             temperature = self.agent().get("temperature")
             if isinstance(temperature, (int, float)):
@@ -749,6 +835,19 @@ async def ws_twilio(request):
                     await ws.send_json({
                         "type": "assistant_text",
                         "text": "This number is not bound to a workspace yet.",
+                    })
+                    continue
+                # TENANT FENCE. This pod was deployed for exactly one workspace and
+                # serves exactly one adapter (AETHER_TENANT_ID travels in its env), so
+                # a stream for any other workspace is refused here rather than answered
+                # with this business's fine-tune. Empty env (a manually launched pod)
+                # keeps the old per-stream behaviour.
+                owner = (os.environ.get("AETHER_WORKSPACE_ID") or "").strip()
+                if owner and workspace_id != owner:
+                    print("voice_relay: refused foreign workspace " + workspace_id + " (this pod serves " + owner + ")", flush=True)
+                    await ws.send_json({
+                        "type": "assistant_text",
+                        "text": "This assistant is not available on this number.",
                     })
                     continue
                 # No call is accepted until the Ear, the Brain and the Mouth all
@@ -866,8 +965,13 @@ async def main():
     except OSError as error:
         print("voice_relay: cannot bind " + HOST + ":" + str(PORT) + " - " + str(error), file=sys.stderr, flush=True)
         return 1
-    print("voice_relay: listening on " + HOST + ":" + str(PORT), flush=True)
-    await asyncio.Event().wait()
+    print("voice_relay: listening on " + HOST + ":" + str(PORT) + " nofile=" + NOFILE, flush=True)
+    try:
+        await asyncio.Event().wait()
+    finally:
+        # One session for the process, closed once: its sockets go with it.
+        await close_session()
+        await runner.cleanup()
     return 0
 
 

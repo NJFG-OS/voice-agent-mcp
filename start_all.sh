@@ -37,10 +37,15 @@ STAGE_FILE="${LOG_DIR}/stage.json"
 # Written once, the first time a stall inside the boot window is provable, so the
 # early failure report is not repeated on every poll.
 STALL_FILE="${LOG_DIR}/boot_stalled.flag"
+# The per-port listener verdict, written once every service gate is green. The ready
+# report carries it, so "the port is open on the pod's interface" is a fact the app
+# records rather than something inferred from a proxy answering.
+LISTENERS_FILE="${LOG_DIR}/listeners.json"
+AETHER_LISTENERS_FILE="$LISTENERS_FILE"
 
 # The generation this script IS. /api/pod-code substitutes its served version here,
 # so the pin is compared against the bytes about to run, not a guess.
-SERVED_VERSION="aether-2026-11-21.27"
+SERVED_VERSION="aether-2026-11-22.31"
 PINNED_VERSION="${AETHER_POD_VERSION:-}"
 
 # What the image's build-time gate selected. Read for diagnostics only.
@@ -54,10 +59,18 @@ WHISPER_PORT=8001
 VLLM_PORT=8002
 TTS_PORT=8080
 
-BOOT_WINDOW="${AETHER_BOOT_WINDOW:-900}"
-WHISPER_TIMEOUT="${AETHER_WHISPER_BOOT_TIMEOUT:-420}"
-# Weights download on a cold cache: the window has to cover ~16GB over fuse.ge.
-VLLM_TIMEOUT="${AETHER_VLLM_BOOT_TIMEOUT:-${AETHER_BOOT_WINDOW:-1800}}"
+# The reporting window: after this long without a ready relay the watchdog records
+# why the boot is not ready yet. It never stops anything by itself.
+BOOT_WINDOW="${AETHER_BOOT_WINDOW:-1800}"
+# The Ear downloads its own weights on a cold volume and may repair a bad cache first.
+WHISPER_TIMEOUT="${AETHER_WHISPER_BOOT_TIMEOUT:-900}"
+# The Brain's OWN window, deliberately not derived from BOOT_WINDOW: a cold first boot
+# downloads ~16GB over fuse.ge and then loads it, and cutting that off at the
+# reporting window is what reported vllm_unhealthy on a pod that was still downloading.
+# AETHER_VLLM_BOOT_TIMEOUT is the canonical name; VLLM_TIMEOUT is accepted as the
+# short alias an operator (or an older template) may still carry, so the engine is
+# never cut off because the two spellings disagreed.
+VLLM_TIMEOUT="${AETHER_VLLM_BOOT_TIMEOUT:-${VLLM_TIMEOUT:-2700}}"
 # A short note only: the worker answers its port immediately and its /health turns
 # 200 once a real synthesis succeeds, which is what the relay gates on. Waiting the
 # full warm-up here would delay the relay for no benefit.
@@ -83,21 +96,25 @@ WS_ID="${AETHER_WORKSPACE_ID:-}"
 NODE_ID="${AETHER_NODE_ID:-}"
 SECRET="${WEBHOOK_SECRET:-${AETHER_WEBHOOK_SECRET:-}}"
 
-export HF_HOME="${HF_HOME:-${WS}/hf-cache}"
-export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${WS}/pip-cache}"
-export PYTHONUNBUFFERED=1
-export AETHER_VLLM_URL="http://127.0.0.1:${VLLM_PORT}"
-export AETHER_TTS_URL="http://127.0.0.1:${TTS_PORT}"
-export AETHER_WHISPER_URL="http://127.0.0.1:${WHISPER_PORT}"
-export AETHER_VLLM_MODEL="${MODEL}"
-export AETHER_VLLM_PORT="${VLLM_PORT}"
-export AETHER_WHISPER_PORT="${WHISPER_PORT}"
-export AETHER_SERVED_MODEL="${MODEL}"
-export AETHER_LOG_DIR="${LOG_DIR}"
-export AETHER_GPU_MEMORY_UTILIZATION="${GPU_UTIL}"
-export AETHER_MAX_MODEL_LEN_24="${MAX_MODEL_LEN}"
-export AETHER_MAX_NUM_SEQS_24="${MAX_NUM_SEQS}"
-export AETHER_RUNTIME_PINS="${PINS_FILE}"
+HF_HOME="${HF_HOME:-${WS}/hf-cache}"
+PIP_CACHE_DIR="${PIP_CACHE_DIR:-${WS}/pip-cache}"
+PYTHONUNBUFFERED=1
+AETHER_VLLM_URL="http://127.0.0.1:${VLLM_PORT}"
+AETHER_TTS_URL="http://127.0.0.1:${TTS_PORT}"
+AETHER_WHISPER_URL="http://127.0.0.1:${WHISPER_PORT}"
+AETHER_VLLM_MODEL="${MODEL}"
+AETHER_VLLM_PORT="${VLLM_PORT}"
+AETHER_WHISPER_PORT="${WHISPER_PORT}"
+AETHER_SERVED_MODEL="${MODEL}"
+AETHER_LOG_DIR="${LOG_DIR}"
+AETHER_GPU_MEMORY_UTILIZATION="${GPU_UTIL}"
+AETHER_MAX_MODEL_LEN_24="${MAX_MODEL_LEN}"
+AETHER_MAX_NUM_SEQS_24="${MAX_NUM_SEQS}"
+AETHER_RUNTIME_PINS="${PINS_FILE}"
+# The relay reports readiness and fetches per-call config from the app, so both must
+# reach it as environment even when this supervisor is started outside the hook.
+if [ -n "$APP" ]; then AETHER_APP_ORIGIN="$APP"; fi
+if [ -n "$SECRET" ]; then WEBHOOK_SECRET="$SECRET"; AETHER_WEBHOOK_SECRET="$SECRET"; fi
 
 # One log for the whole boot, mirrored into boot_diag.log for the diagnostics panel.
 log() {
@@ -138,11 +155,27 @@ release_supervisor_lock() {
   rm -rf "$LOCK_DIR" 2>/dev/null || true
 }
 
+# A pid in the lock file is the holder only when that pid is ALIVE and its command
+# line is a start_all.sh run. The lock directory lives on the persistent volume, so a
+# terminated pod leaves one behind; the container that replaces it reuses low pids,
+# and a bare kill -0 then saw "a live supervisor" in an unrelated process and refused
+# to start the stack at all.
+lock_holder_is_supervisor() {
+  local pid="$1" cmd
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+  case "$cmd" in
+    *start_all.sh*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 acquire_supervisor_lock() {
   local holder
   if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     holder="$(cat "$LOCK_PID" 2>/dev/null || true)"
-    if [ -n "$holder" ] && [ "$holder" != "$$" ] && kill -0 "$holder" 2>/dev/null; then
+    if lock_holder_is_supervisor "$holder" && [ "$holder" != "$$" ]; then
       log "supervisor lock: pid $holder already runs this pod - refusing to start a second stack"
       return 1
     fi
@@ -214,6 +247,18 @@ clear_stale_workers() {
 clear_stale_workers
 log "stale Aether workers cleared (ownership by command line, never by port)"
 
+# Stale runtime files from the PREVIOUS container. LOG_DIR is on the persistent
+# volume, so these outlive the pod: a recycled pid left in whisper.pid reads as "still
+# starting" and hides a worker that died, and a vllm_mode.json left by a LoRA boot
+# routes the relay to an adapter this pod never loaded. Cleared while the supervisor
+# lock is held, before any service starts. Nothing here is chmod'ed or chown'ed.
+clear_stale_runtime_files() {
+  rm -f "${LOG_DIR}"/*.pid 2>/dev/null || true
+  rm -f "$STAGE_FILE" "$STALL_FILE" "${LOG_DIR}/vllm_mode.json" "$LISTENERS_FILE" 2>/dev/null || true
+}
+clear_stale_runtime_files
+log "stale pid/lock/stage files cleared from ${LOG_DIR}"
+
 # Every boot starts its service logs empty. The logs live on the persistent volume,
 # so without this a failure's tail mixes generations - an old vLLM traceback reads
 # as this boot's crash and sends the diagnosis down the wrong path.
@@ -280,11 +325,22 @@ report() {
   body=$(python3 - "$kind" "$POD" "$WS_ID" "$NODE_ID" "$reason" "$stage" "${AETHER_SERVED_MODEL:-}" "$GPU_NAME" "$VRAM_GB" <<'PY'
 import datetime, json, os, sys
 kind, pod, ws, node, reason, stage, served, gpu, vram = sys.argv[1:10]
+
+
+def listeners():
+    path = os.environ.get("AETHER_LISTENERS_FILE") or ""
+    try:
+        return json.load(open(path)) if path else {}
+    except Exception:
+        return {}
+
+
 if kind == "ready":
     print(json.dumps({
         "pod_id": pod, "workspace_id": ws, "node_id": node,
         "status": "ready", "port": 8000,
         "ports": {"8000": "relay", "8001": "whisper", "8002": "vllm", "8080": "tts"},
+        "listeners": listeners(),
         "mount_ok": True, "gpu_ok": True,
         "whisper_ok": True, "vllm_ok": True, "tts_ok": True, "relay_ok": True,
         "gpu_name": gpu, "vram_gb": vram, "served_model": served,
@@ -373,7 +429,7 @@ PYVERIFY
     then
       log "version gate: verified restart upgrade $PINNED_VERSION -> $SERVED_VERSION"
       PINNED_VERSION="$SERVED_VERSION"
-      export AETHER_POD_VERSION="$SERVED_VERSION"
+      AETHER_POD_VERSION="$SERVED_VERSION"
     else
       gate_fail version version_mismatch "pod pinned $PINNED_VERSION but no verified $SERVED_VERSION tree exists"
     fi
@@ -412,6 +468,9 @@ preflight() {
 
   free_gb=$(df -Pm "${WS}" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024}')
   log "preflight: free disk ${free_gb:-unknown}GB on ${WS}"
+  # The file-descriptor budget every child inherits. A soft limit of 1024 is what a
+  # live call's sockets exhausted into EMFILE, so it is logged, not assumed.
+  log "preflight: nofile soft=$(ulimit -Sn 2>/dev/null || echo unknown) hard=$(ulimit -Hn 2>/dev/null || echo unknown)"
 
   if ! command -v nvidia-smi >/dev/null 2>&1; then
     log "preflight: nvidia-smi is not on PATH - no GPU visible"
@@ -457,7 +516,7 @@ runtime_gate
 # imports below passed, so this asserts the running interpreter rather than
 # installing anything. vllm._C is the compiled extension: importing it proves the
 # wheel matches this image's torch and CUDA stack. No private torch symbol is
-# asserted — requiring one that torch 2.4.x does not export is what reported
+# asserted — requiring one that torch 2.4.x does not is what reported
 # vllm_import_failed on healthy boots.
 # ---------------------------------------------------------------------------
 verify_vllm_runtime() {
@@ -497,6 +556,9 @@ runtime_diagnostics() {
   first=$(nvidia-smi 2>/dev/null | head -n1 | tr -d '\r' | cut -c1-240)
   log "diagnostics: nvidia-smi: ${first:-unavailable}"
   log "diagnostics: torch: $("$PY_BIN" -c 'import torch; print(torch.__version__, torch.version.cuda)' 2>/dev/null || echo unavailable)"
+  # NumPy is the one pin that can silently break torch, vLLM, transformers and the
+  # training extras at once, so the version this pod actually imports is stated here.
+  log "diagnostics: numpy: $("$PY_BIN" -c 'import numpy; print(numpy.__version__)' 2>/dev/null || echo unavailable)"
   log "diagnostics: vllm: $("$PY_BIN" -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo unavailable)"
   log "diagnostics: runtime pins: $(tr -d '\n' < "$PINS_FILE" 2>/dev/null || echo missing)"
   log "diagnostics: python: $PY_BIN"
@@ -504,6 +566,13 @@ runtime_diagnostics() {
   # The relay cannot bind 8000 without this, and a missing wheel used to show only as
   # a restart loop in relay.log. Naming it here makes it a one-line diagnosis.
   log "diagnostics: aiohttp: $("$PY_BIN" -c 'import aiohttp; print(aiohttp.__version__)' 2>/dev/null || echo MISSING)"
+  # The Ear's model and its cache folder: a 0-byte blob on the volume is what stops
+  # the worker loading, so naming the folder here makes that a one-line diagnosis.
+  log "diagnostics: whisper: model=${AETHER_WHISPER_MODEL:-base} port=${WHISPER_PORT} (loopback only)"
+  for _wdir in "${HF_HOME}/hub"/models--Systran--faster-whisper-*; do
+    [ -d "$_wdir" ] || continue
+    log "diagnostics: whisper cache: $(basename "$_wdir") $(du -sh "$_wdir" 2>/dev/null | cut -f1)"
+  done
   log "diagnostics: HF_HOME=${HF_HOME}"
   mkdir -p "${HF_HOME}" 2>/dev/null || true
   ls -la "${HF_HOME}" 2>/dev/null | head -n 10 | while IFS= read -r _row; do log "diagnostics: hf-cache: ${_row}"; done
@@ -578,8 +647,8 @@ PY
 )
 fi
 if [ -n "${ADAPTER_ALIAS:-}" ]; then
-  export AETHER_SERVED_MODEL="$ADAPTER_ALIAS"
-  export AETHER_LORA_ALIAS="$ADAPTER_ALIAS"
+  AETHER_SERVED_MODEL="$ADAPTER_ALIAS"
+  AETHER_LORA_ALIAS="$ADAPTER_ALIAS"
   log "adapter routing: serving tenant ${TENANT_ID} adapter as model=${ADAPTER_ALIAS}"
 else
   log "adapter routing: no approved adapter - serving base model ${MODEL}"
@@ -688,6 +757,73 @@ wait_health_progress() {
   return 1
 }
 
+# The Ear's own gate. whisper_server.py answers 200 from its first second so that
+# "alive" and "loaded" stay distinguishable - which is why a plain wait_health
+# returned at once and a model that never loaded showed only as "not answering yet".
+# This waits for the MODEL, and every 30s it copies the worker's own stage/detail into
+# the boot log, so a cold download, a repaired cache or a failed load is named in
+# whisper.log and boot_diag.log while it is happening.
+wait_whisper_ready() {
+  local url="$1" timeout="$2" waited=0 body wstage wdetail last
+  while [ "$waited" -lt "$timeout" ]; do
+    body=$(curl -sS -m 5 "$url" 2>/dev/null || true)
+    if printf '%s' "$body" | grep -Eq '"ready": *true'; then
+      log "health: whisper ready after ${waited}s"
+      return 0
+    fi
+    # A bounded restart loop that gave up leaves no process behind: stop waiting for
+    # a worker that is no longer running and report it now.
+    if [ -f "${LOG_DIR}/whisper.pid" ] && ! kill -0 "$(cat "${LOG_DIR}/whisper.pid" 2>/dev/null)" 2>/dev/null; then
+      log "health: whisper has no running process (its restart loop stopped) - reporting now"
+      return 1
+    fi
+    if [ $((waited % 30)) -eq 0 ]; then
+      wstage=$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("stage",""))' 2>/dev/null || true)
+      wdetail=$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("detail",""))' 2>/dev/null || true)
+      last=$(tail -n 1 "${LOG_DIR}/whisper.log" 2>/dev/null | tr -d '\r' | cut -c1-200)
+      log "health: whisper still loading after ${waited}s (stage=${wstage:-unreachable} detail=${wdetail:-none})"
+      [ -n "$last" ] && log "whisper.log: $last"
+    fi
+    sleep 10
+    waited=$((waited + 10))
+  done
+  log "health: whisper did not become ready within ${timeout}s"
+  return 1
+}
+
+# The port verdict. Every service gate above proves a PROCESS is healthy; this proves
+# the PORT is open on 127.0.0.1 as well, which is what the provider's proxy needs (and
+# what a loopback-only bind silently failed). The answer is written to
+# listeners.json and travels in the ready report, so a closed port is visible in the
+# app instead of only in the pod.
+verify_listeners() {
+  local out port missing=""
+  out=$(python3 - "$RELAY_PORT" "$WHISPER_PORT" "$VLLM_PORT" "$TTS_PORT" <<'PY'
+import json, socket, sys
+state = {}
+for port in sys.argv[1:]:
+    sock = socket.socket()
+    sock.settimeout(2)
+    try:
+        state[port] = sock.connect_ex(("127.0.0.1", int(port))) == 0
+    finally:
+        sock.close()
+print(json.dumps(state, sort_keys=True))
+PY
+)
+  [ -n "$out" ] || out="{}"
+  printf '%s\n' "$out" > "$LISTENERS_FILE" 2>/dev/null || true
+  for port in "$RELAY_PORT" "$WHISPER_PORT" "$VLLM_PORT" "$TTS_PORT"; do
+    case "$out" in
+      *"\"$port\": true"*) log "port $port: listening" ;;
+      *) log "port $port: NOT listening"; missing="$missing $port" ;;
+    esac
+  done
+  log "listeners: $out"
+  [ -z "$missing" ] || { log "closed port(s):$missing"; return 1; }
+  return 0
+}
+
 # 1) The relay FIRST. It is the pod's only public port and it needs no engine to
 #    bind, so it starts before anything loads. Binding 8000 only after the engines
 #    were healthy is what made a slow boot look like a dead pod: until something
@@ -722,15 +858,26 @@ if ! wait_health_progress vllm "http://127.0.0.1:${VLLM_PORT}/health" "$VLLM_TIM
 fi
 stage vllm_ready "engine answered /health on ${VLLM_PORT}"
 
-# 4) The Ear and the Voice are noted, not gated: the relay's own deps_ok reports
-#    them, and a process that is alive still serves once its model finishes loading.
-wait_health whisper "http://127.0.0.1:${WHISPER_PORT}/health" "$WHISPER_TIMEOUT" \
-  || log "whisper is not answering yet - continuing, the relay reports it"
+# 4) The Ear is waited on for its MODEL, not just for its port, and a worker that never
+#    loads becomes a NAMED failure with its own log tail in the boot record - not the
+#    silent "not answering yet" that left whisper unready and unexplained. The pod is
+#    not held on it: the Brain and the relay still serve, and the relay's deps_ok keeps
+#    reporting the Ear until it comes up.
+if ! wait_whisper_ready "http://127.0.0.1:${WHISPER_PORT}/health" "$WHISPER_TIMEOUT"; then
+  log "whisper.log tail (60 lines):"
+  tail -n 60 "${LOG_DIR}/whisper.log" >> "$SUPERVISOR_LOG" 2>/dev/null || true
+  write_fail whisper whisper_not_ready "no ready /health on ${WHISPER_PORT} within ${WHISPER_TIMEOUT}s"
+  report boot_failure whisper_not_ready whisper
+  log "whisper is not ready - continuing, the relay's deps_ok reports it"
+fi
+# The Voice is noted, not gated: a process that is alive still speaks once its model
+# finishes warming, and the relay's deps_ok reports it meanwhile.
 wait_health tts "http://127.0.0.1:${TTS_PORT}/health" "$TTS_TIMEOUT" \
   || log "tts: no /health yet - keeping the process alive"
 
 stage services_ready "whisper=${WHISPER_PORT} vllm=${VLLM_PORT} tts=${TTS_PORT} relay=${RELAY_PORT}"
 log "boot complete: whisper=${WHISPER_PORT} vllm=${VLLM_PORT} tts=${TTS_PORT} relay=${RELAY_PORT}"
+verify_listeners || log "one or more ports are not listening - see the per-port lines above"
 
 # ---------------------------------------------------------------------------
 # Watchdog. Every 30s it reads the relay's own health; once every service gate is
