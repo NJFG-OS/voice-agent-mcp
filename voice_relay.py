@@ -165,7 +165,11 @@ def answer_model():
 # Twilio mu-law is 8 kHz mono, 160 bytes = 20 ms per frame.
 FRAME_BYTES = 160
 VOICE_RMS = 420          # speech energy floor on 16-bit PCM
-SILENCE_FRAMES = 38      # ~0.76 s of silence closes an utterance
+# ~0.36 s of silence closes an utterance. A caller pausing to think mid-sentence is normal, and
+# 0.76 s read as Hank having cut them off; much shorter talks over them. This window is the only
+# delay between the caller stopping and the turn being dispatched, so the transcript, the model and
+# the first clause of the reply all start the moment it expires.
+SILENCE_FRAMES = 18
 MIN_SPEECH_FRAMES = 6    # ignore blips shorter than ~120 ms
 
 # workspace_id -> config pushed by the app (or fetched per stream). Per workspace,
@@ -573,6 +577,29 @@ def wav_to_mulaw(payload):
     return audioop.lin2ulaw(frames, 2)
 
 
+CLAUSE_RE = re.compile(r"[^.!?;:]+[.!?;:]*\s*")
+
+
+def speakable_clauses(text):
+    """The reply cut where a person would breathe.
+
+    Synthesizing a whole paragraph before sending one byte made the caller wait for the last
+    sentence to hear the first. Each clause is its own TTS job, so audio starts as soon as the
+    opening words exist; a short tail is folded into the clause before it instead of becoming a
+    one-word job.
+    """
+    parts = [part.strip() for part in CLAUSE_RE.findall(text or "") if part.strip()]
+    if not parts:
+        return [text.strip()] if (text or "").strip() else []
+    out = []
+    for part in parts:
+        if out and len(part) < 12:
+            out[-1] = (out[-1] + " " + part).strip()
+        else:
+            out.append(part)
+    return out
+
+
 class Session:
     """One Twilio stream. Its agent, transcript and tools belong to this call only."""
 
@@ -662,26 +689,32 @@ class Session:
         if not text:
             return
         agent = self.agent()
-        wav = await tts_wav(text, agent.get("voice_id"), agent.get("emotional_tone"))
-        if not wav:
-            return
-        try:
-            payload = wav_to_mulaw(wav)
-        except Exception:
-            return
         mark = self.generation
         self.speaking = True
         try:
-            for start in range(0, len(payload), FRAME_BYTES):
+            # SPEAK THE FIRST CLAUSE, NOT THE WHOLE PARAGRAPH. Each clause is synthesized and
+            # streamed in order, so the caller hears the opening words while the rest is still
+            # being made, and a barge-in stops the remaining clauses instead of one long clip.
+            for clause in speakable_clauses(text):
                 if mark != self.generation or ws.closed:
                     break
-                chunk = payload[start:start + FRAME_BYTES]
-                await ws.send_json({
-                    "event": "media",
-                    "streamSid": self.stream_sid,
-                    "media": {"payload": base64.b64encode(chunk).decode("ascii")},
-                })
-                await asyncio.sleep(0.02)
+                wav = await tts_wav(clause, agent.get("voice_id"), agent.get("emotional_tone"))
+                if not wav:
+                    continue
+                try:
+                    payload = wav_to_mulaw(wav)
+                except Exception:
+                    continue
+                for start in range(0, len(payload), FRAME_BYTES):
+                    if mark != self.generation or ws.closed:
+                        break
+                    chunk = payload[start:start + FRAME_BYTES]
+                    await ws.send_json({
+                        "event": "media",
+                        "streamSid": self.stream_sid,
+                        "media": {"payload": base64.b64encode(chunk).decode("ascii")},
+                    })
+                    await asyncio.sleep(0.02)
             if mark == self.generation and not ws.closed:
                 await ws.send_json({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": "reply"}})
         finally:
