@@ -164,13 +164,74 @@ def answer_model():
 
 # Twilio mu-law is 8 kHz mono, 160 bytes = 20 ms per frame.
 FRAME_BYTES = 160
+FRAME_MS = 20
+FRAME_SECONDS = FRAME_MS / 1000.0
 VOICE_RMS = 420          # speech energy floor on 16-bit PCM
-# ~0.36 s of silence closes an utterance. A caller pausing to think mid-sentence is normal, and
-# 0.76 s read as Hank having cut them off; much shorter talks over them. This window is the only
-# delay between the caller stopping and the turn being dispatched, so the transcript, the model and
-# the first clause of the reply all start the moment it expires.
-SILENCE_FRAMES = 18
-MIN_SPEECH_FRAMES = 6    # ignore blips shorter than ~120 ms
+
+
+# ---- turn-taking policy ------------------------------------------------------
+# Every value below is overridable from the app: the config it pushes carries a turn_taking block, so
+# a shop's phone manner is a setting rather than a constant buried in a service. These are the
+# defaults the app ships with.
+def _ms(name, default):
+    try:
+        value = int(os.environ.get(name) or default)
+    except Exception:
+        value = default
+    return value if value > 0 else default
+
+
+SILENCE_HOLD_MS = _ms("HANK_SILENCE_MS", 450)             # an ordinary thought
+SILENCE_SIMPLE_MS = _ms("HANK_SILENCE_SIMPLE_MS", 375)    # yes/no, confirmation
+SILENCE_DETAIL_MS = _ms("HANK_SILENCE_DETAIL_MS", 700)    # year/make/model, VIN, symptoms, contact
+SILENCE_HOLD_LONG_MS = _ms("HANK_SILENCE_HOLD_MS", 2000)  # "hold on", "let me check"
+DEAD_AIR_MS = _ms("HANK_DEAD_AIR_MS", 6000)               # check in rather than sit in silence
+MIN_SPEECH_MS = _ms("HANK_MIN_SPEECH_MS", 250)            # audio below this is noise, not a turn
+BACKCHANNEL_MS = _ms("HANK_BACKCHANNEL_MS", 600)          # "yeah"/"uh-huh" under this is an ack
+ECHO_GUARD_MS = _ms("HANK_ECHO_GUARD_MS", 200)            # deaf window after playback / clear
+FILLER_AFTER_MS = _ms("HANK_FILLER_AFTER_MS", 350)        # a slower tool earns a cached filler
+
+DEFAULT_POLICY = {
+    "silence_ms": SILENCE_HOLD_MS,
+    "silence_simple_ms": SILENCE_SIMPLE_MS,
+    "silence_detail_ms": SILENCE_DETAIL_MS,
+    "silence_hold_ms": SILENCE_HOLD_LONG_MS,
+    "dead_air_ms": DEAD_AIR_MS,
+    "min_speech_ms": MIN_SPEECH_MS,
+    "backchannel_ms": BACKCHANNEL_MS,
+    "echo_guard_ms": ECHO_GUARD_MS,
+    "filler_after_ms": FILLER_AFTER_MS,
+}
+
+# A backchannel is an acknowledgement, never an answer. It only suppresses a barge-in while Hank is
+# mid-sentence, so a real "yes" to a question that has finished asking is still a turn.
+BACKCHANNELS = {
+    "yeah", "yep", "yea", "yes", "yup", "uh", "huh", "uhhuh", "uhhuhh", "mm", "mmhmm", "mhm",
+    "hm", "hmm", "ok", "okay", "k", "right", "sure", "alright", "gotcha", "got", "it", "i", "see",
+    "thanks", "thank", "you", "no", "nope", "nah",
+}
+# Words that always take the turn, however short: a correction or a stop is not an acknowledgement.
+STOP_WORDS = {"stop", "wait", "cancel", "hold", "actually", "wrong", "listen", "quiet", "shush"}
+
+# The static lines the bridge pre-synthesizes at the start of a call, so they replay with no TTS wait.
+# Shop-independent by design: that is exactly what makes them cacheable.
+PHRASES = {
+    "filler": "One moment, let me check that.",
+    "check_in": "Are you still there? Take your time.",
+    "hold_ack": "No problem, take your time.",
+    "lookup": "Let me pull that up.",
+    "triage": "Got it. And how long has that been happening?",
+}
+# (voice, text) -> 8 kHz mu-law bytes. Filled by warm_phrases() and reused by every call on the pod.
+PHRASE_AUDIO = {}
+
+
+def phrase_audio(text, voice=""):
+    return PHRASE_AUDIO.get((voice or "", text))
+
+
+def frame_count(ms):
+    return max(1, int(round(float(ms) / FRAME_MS)))
 
 # workspace_id -> config pushed by the app (or fetched per stream). Per workspace,
 # never one process-wide agent.
@@ -601,7 +662,7 @@ def speakable_clauses(text):
 
 
 class Session:
-    """One Twilio stream. Its agent, transcript and tools belong to this call only."""
+    """One Twilio stream. Its agent, transcript, tools and turn-taking state belong to this call only."""
 
     def __init__(self, stream_sid, workspace_id, agent_uuid, call_sid):
         self.stream_sid = stream_sid
@@ -616,13 +677,50 @@ class Session:
         self.speaking = False
         self.turn = None
         self.busy = False
+        # Every response is one generation. A barge-in, a clear or a new response retires the old
+        # number, and any audio, mark or TTS chunk still arriving under it is dropped.
         self.generation = 0
+        self.turn_id = 0
+        self.delivered = []
+        self.tts_tasks = {}
+        self.brain_task = None
+        self.dead_air_task = None
+        self.hold_ms = SILENCE_HOLD_MS
+        self.hold_from_app = 0
+        self.echo_until = 0.0
+        self.last_activity = time.time()
+        self.barge_frames = 0
         self.started = time.time()
         # Prompt fragment handed back by the app's workflow graph for this turn.
         self.turn_note = ""
         # Last thing the agent said, reported with the next turn so the app can
         # persist it on the call's workflow trace.
         self.last_reply = ""
+        # The live structured intake, as the app last confirmed it.
+        self.intake = {}
+
+    # ---- policy ----
+    def policy(self):
+        pushed = (self.config or {}).get("turn_taking") or {}
+        policy = dict(DEFAULT_POLICY)
+        for key, default in DEFAULT_POLICY.items():
+            value = pushed.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                policy[key] = int(value)
+        return policy
+
+    def log_turn(self, event, **fields):
+        """One structured line per turn event: ids, timings and booleans. Never an audio payload."""
+        record = {
+            "event": event,
+            "stream": self.stream_sid,
+            "call_sid": self.call_sid,
+            "workspace_id": self.workspace_id,
+            "turn_id": self.turn_id,
+            "generation_id": self.generation,
+        }
+        record.update({key: value for key, value in fields.items() if value is not None})
+        print("voice_relay: " + json.dumps(record, default=str), flush=True)
 
     def agent(self):
         return (self.config or {}).get("agent") or {}
@@ -646,6 +744,59 @@ class Session:
         parts.append("Never ask again for anything the caller has already told you in this call - use what they said.")
         return "\n".join(parts)
 
+    def generation_pending(self):
+        return bool(self.brain_task and not self.brain_task.done())
+
+    def is_backchannel(self, text):
+        """A short standalone acknowledgement: 'yeah', 'uh-huh', 'okay'. Never a correction."""
+        words = re.sub(r"[^a-z' ]", " ", (text or "").lower()).split()
+        if not words or len(words) > 3:
+            return False
+        if any(word in STOP_WORDS for word in words):
+            return False
+        return all(word in BACKCHANNELS for word in words)
+
+    def hold_for(self, text):
+        """The silence this reply earns, from the question it just asked."""
+        policy = self.policy()
+        low = (text or "").lower()
+        if re.search(r"hold on|one moment|one sec|just a (moment|second)|let me (check|look|pull|see|find)", low):
+            return policy["silence_hold_ms"]
+        if re.search(
+            r"\b(year|make|model|vin|licen[cs]e plate|plate number|mileage|odometer|symptom|address|"
+            r"phone number|callback|e-?mail|best number|spell)\b",
+            low,
+        ):
+            return policy["silence_detail_ms"]
+        if re.search(
+            r"\b(is that|do you|does it|did you|are you|can you|would you|will you|have you|"
+            r"any (noise|lights|warning))\b",
+            low,
+        ):
+            return policy["silence_simple_ms"]
+        return policy["silence_ms"]
+
+    # ---- cached phrases ----
+    async def warm_phrases(self):
+        """Synthesize the static lines once per pod and voice, so they play with no TTS wait."""
+        agent = self.agent()
+        voice = agent.get("voice_id") or ""
+        tone = agent.get("emotional_tone")
+        warmed = 0
+        for text in PHRASES.values():
+            if phrase_audio(text, voice) is not None:
+                warmed += 1
+                continue
+            wav = await tts_wav(text, voice, tone)
+            if not wav:
+                continue
+            try:
+                PHRASE_AUDIO[(voice, text)] = wav_to_mulaw(wav)
+                warmed += 1
+            except Exception:
+                continue
+        self.log_turn("phrases_warm", cached=warmed, phrases=len(PHRASES))
+
     # ---- caller audio in ----
     async def feed(self, ws, payload):
         try:
@@ -653,95 +804,248 @@ class Session:
             level = audioop.rms(pcm, 2)
         except Exception:
             return
+        now = time.time()
+        # ECHO GUARD. Right after playback starts or a clear is sent, what arrives is the line's own
+        # echo and the frames already buffered - never a reason for Hank to interrupt himself.
+        if now < self.echo_until:
+            return
+        policy = self.policy()
         if level >= VOICE_RMS:
-            # Barge-in: the caller speaking over the agent stops it immediately.
-            if self.speaking:
-                await self.interrupt(ws)
+            if self.dead_air_task and not self.dead_air_task.done():
+                self.dead_air_task.cancel()
+            self.last_activity = now
             self.audio.extend(payload)
             self.speech_frames += 1
             self.silence_frames = 0
+            if self.speaking or self.generation_pending():
+                # While Hank is talking only SUSTAINED speech takes the turn: a "yeah" that stops
+                # after 300 ms is an acknowledgement, a caller who keeps going is interrupting.
+                self.barge_frames += 1
+                if self.barge_frames * FRAME_MS >= policy["backchannel_ms"]:
+                    self.barge_frames = 0
+                    await self.interrupt(ws, reason="sustained_speech")
             return
         if not self.speech_frames:
             return
         self.audio.extend(payload)
         self.silence_frames += 1
-        if self.silence_frames < SILENCE_FRAMES:
+        if self.silence_frames * FRAME_MS < self.hold_ms:
             return
+        # The hold expired: the caller has finished a thought.
         chunk = bytes(self.audio)
         frames = self.speech_frames
         self.audio = bytearray()
         self.speech_frames = 0
         self.silence_frames = 0
-        if frames < MIN_SPEECH_FRAMES or self.busy:
+        self.barge_frames = 0
+        spoke_ms = frames * FRAME_MS
+        if spoke_ms < policy["min_speech_ms"]:
+            self.log_turn("noise_ignored", speech_ms=spoke_ms)
             return
-        self.turn = asyncio.create_task(self.respond(ws, chunk))
+        if self.busy:
+            return
+        heard = ""
+        if self.speaking or self.generation_pending():
+            # The utterance ended inside the backchannel window. It only counts if it was not just
+            # an acknowledgement: Hank's sentence survives a "mm-hm".
+            heard = await self.transcribe(mulaw_to_wav(chunk))
+            if heard and spoke_ms < policy["backchannel_ms"] and self.is_backchannel(heard):
+                self.log_turn("backchannel_ignored", speech_ms=spoke_ms, words=len(heard.split()))
+                return
+            await self.interrupt(ws, reason="caller_took_turn")
+        self.turn_id += 1
+        self.log_turn("turn_start", speech_ms=spoke_ms, silence_ms=self.hold_ms)
+        self.turn = asyncio.create_task(self.respond(ws, chunk, heard))
 
-    async def interrupt(self, ws):
+    async def interrupt(self, ws, reason="speech"):
+        """Stop Hank mid-word: flush the carrier, retire the generation, cancel its work."""
+        if not (self.speaking or self.generation_pending()):
+            return
+        retired = self.generation
         self.generation += 1
         self.speaking = False
+        cancelled = 0
+        for task in list(self.tts_tasks.values()):
+            if not task.done():
+                task.cancel()
+                cancelled += 1
+        self.tts_tasks = {}
+        if self.brain_task and not self.brain_task.done():
+            self.brain_task.cancel()
+            cancelled += 1
+        self.brain_task = None
+        cleared = await self.send_clear(ws)
+        self.log_turn(
+            "barge_in",
+            reason=reason,
+            retired_generation=retired,
+            clear_sent=cleared,
+            tts_cancelled=cancelled,
+            delivered=len(self.delivered),
+        )
+
+    async def send_clear(self, ws):
+        """Twilio's own flush: everything queued for this stream is dropped, not played later."""
         try:
             await ws.send_json({"event": "clear", "streamSid": self.stream_sid})
         except Exception:
-            pass
+            return False
+        self.echo_until = time.time() + self.policy()["echo_guard_ms"] / 1000.0
+        return True
 
     # ---- agent audio out ----
-    async def say(self, ws, text):
+    async def synth(self, text):
+        agent = self.agent()
+        wav = await tts_wav(text, agent.get("voice_id"), agent.get("emotional_tone"))
+        if not wav:
+            return None
+        try:
+            return wav_to_mulaw(wav)
+        except Exception:
+            return None
+
+    async def say(self, ws, text, generation=None):
         if not text:
             return
-        agent = self.agent()
-        mark = self.generation
+        if generation is None:
+            self.generation += 1
+            generation = self.generation
+        voice = self.agent().get("voice_id") or ""
+        clauses = speakable_clauses(text)
         self.speaking = True
+        self.delivered = []
+        # The first frames of a response are the moment the line starts echoing.
+        self.echo_until = time.time() + self.policy()["echo_guard_ms"] / 1000.0
+        tasks = {}
         try:
-            # SPEAK THE FIRST CLAUSE, NOT THE WHOLE PARAGRAPH. Each clause is synthesized and
-            # streamed in order, so the caller hears the opening words while the rest is still
-            # being made, and a barge-in stops the remaining clauses instead of one long clip.
-            for clause in speakable_clauses(text):
-                if mark != self.generation or ws.closed:
+            # SENTENCE-LEVEL STREAMING. Every clause is its own TTS job, dispatched now and played in
+            # order, so the caller hears the opening words while the rest is still being made.
+            for index, clause in enumerate(clauses):
+                if phrase_audio(clause, voice) is None:
+                    tasks[index] = asyncio.create_task(self.synth(clause))
+            self.tts_tasks = tasks
+            for index, clause in enumerate(clauses):
+                if generation != self.generation or ws.closed:
                     break
-                wav = await tts_wav(clause, agent.get("voice_id"), agent.get("emotional_tone"))
-                if not wav:
+                payload = phrase_audio(clause, voice)
+                if payload is None:
+                    task = tasks.get(index)
+                    if task is None:
+                        continue
+                    try:
+                        payload = await asyncio.wait_for(asyncio.shield(task), timeout=15)
+                    except Exception:
+                        payload = None
+                if not payload:
                     continue
-                try:
-                    payload = wav_to_mulaw(wav)
-                except Exception:
-                    continue
-                for start in range(0, len(payload), FRAME_BYTES):
-                    if mark != self.generation or ws.closed:
-                        break
-                    chunk = payload[start:start + FRAME_BYTES]
-                    await ws.send_json({
-                        "event": "media",
-                        "streamSid": self.stream_sid,
-                        "media": {"payload": base64.b64encode(chunk).decode("ascii")},
-                    })
-                    await asyncio.sleep(0.02)
-            if mark == self.generation and not ws.closed:
-                await ws.send_json({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": "reply"}})
+                if generation != self.generation or ws.closed:
+                    break
+                if await self.stream(ws, payload, generation):
+                    self.delivered.append(clause)
+            if generation == self.generation and not ws.closed:
+                await ws.send_json({
+                    "event": "mark",
+                    "streamSid": self.stream_sid,
+                    "mark": {"name": "reply", "generation": generation},
+                })
         finally:
-            if mark == self.generation:
+            for task in tasks.values():
+                if not task.done():
+                    task.cancel()
+            if generation == self.generation:
                 self.speaking = False
+                self.schedule_dead_air(ws)
+
+    async def stream(self, ws, payload, generation):
+        """Send one clause's frames. False the moment the generation it belongs to is retired."""
+        for start in range(0, len(payload), FRAME_BYTES):
+            if generation != self.generation or ws.closed:
+                return False
+            chunk = payload[start:start + FRAME_BYTES]
+            await ws.send_json({
+                "event": "media",
+                "streamSid": self.stream_sid,
+                "media": {"payload": base64.b64encode(chunk).decode("ascii")},
+            })
+            await asyncio.sleep(FRAME_SECONDS)
+        return True
+
+    # ---- dead air ----
+    def schedule_dead_air(self, ws):
+        if self.dead_air_task and not self.dead_air_task.done():
+            self.dead_air_task.cancel()
+        self.dead_air_task = asyncio.create_task(self.check_in(ws))
+
+    async def check_in(self, ws):
+        """A question followed by nothing is a stuck call, not a silent one."""
+        policy = self.policy()
+        try:
+            await asyncio.sleep(policy["dead_air_ms"] / 1000.0)
+        except asyncio.CancelledError:
+            return
+        if ws.closed or self.speaking or self.busy or self.speech_frames:
+            return
+        waited = int((time.time() - self.last_activity) * 1000)
+        if waited < policy["dead_air_ms"]:
+            return
+        self.log_turn("dead_air_check_in", silence_ms=waited)
+        await self.say(ws, PHRASES["check_in"])
 
     # ---- one conversational turn ----
-    async def respond(self, ws, payload):
+    async def respond(self, ws, payload, heard=""):
         self.busy = True
+        turn_id = self.turn_id
+        started = time.time()
         try:
-            heard = await self.transcribe(mulaw_to_wav(payload))
             if not heard:
+                heard = await self.transcribe(mulaw_to_wav(payload))
+            if not heard:
+                self.log_turn("empty_transcript", turn_id=turn_id)
                 return
             try:
                 await ws.send_json({"type": "user_text", "text": heard})
             except Exception:
                 return
-            answer = await self.brain(heard)
+            self.brain_task = asyncio.create_task(self.brain(heard))
+            policy = self.policy()
+            answer = None
+            try:
+                # A tool that runs long must not be dead air: the cached filler plays while it works.
+                answer = await asyncio.wait_for(
+                    asyncio.shield(self.brain_task), timeout=policy["filler_after_ms"] / 1000.0
+                )
+            except asyncio.TimeoutError:
+                self.log_turn("filler_played", turn_id=turn_id, wait_ms=int((time.time() - started) * 1000))
+                await self.say(ws, PHRASES["filler"])
+                answer = await self.brain_task
+            finally:
+                self.brain_task = None
             if not answer:
+                self.log_turn("empty_answer", turn_id=turn_id)
                 return
             try:
                 await ws.send_json({"type": "assistant_text", "text": answer})
             except Exception:
                 return
+            self.hold_ms = self.hold_from_app or self.hold_for(answer)
             await self.say(ws, answer)
+            self.note_interrupted()
         finally:
             self.busy = False
+
+    def note_interrupted(self):
+        """Only the words the caller actually heard belong in the conversation."""
+        if not self.delivered:
+            return
+        spoken = " ".join(self.delivered).strip()
+        if not spoken:
+            return
+        for entry in reversed(self.history):
+            if entry.get("role") == "assistant" and entry.get("content"):
+                if len(spoken) + 12 < len(str(entry["content"])):
+                    entry["content"] = spoken + " [interrupted]"
+                    self.last_reply = entry["content"]
+                break
 
     async def transcribe(self, wav):
         result = await app_json("/api/pod/transcribe", {
@@ -765,12 +1069,20 @@ class Session:
             "call_sid": self.call_sid,
             "text": text,
             "previous_reply": self.last_reply,
+            "intake": self.intake,
         }, timeout=25)
 
     async def brain(self, text):
         # The graph is walked before the model speaks, so this turn already knows
         # which step it is in - or that the workflow ended the call.
         step = await self.workflow_turn(text)
+        if step:
+            # The app is the record for the intake and for the hold this question earns.
+            if isinstance(step.get("intake"), dict):
+                self.intake = step["intake"]
+            hold = step.get("silence_hold_ms")
+            if isinstance(hold, (int, float)) and not isinstance(hold, bool) and hold > 0:
+                self.hold_from_app = int(hold)
         if step and step.get("ended"):
             closing = str(step.get("closing") or "Thank you for calling. Goodbye.")
             self.history.append({"role": "user", "content": text})
@@ -833,6 +1145,7 @@ class Session:
             "call_sid": self.call_sid,
             "slug": slug or "",
             "arguments": arguments,
+            "intake": self.intake,
         }, timeout=20)
         return result or {"ok": False, "error": "tool_unreachable"}
 
@@ -897,6 +1210,7 @@ async def ws_twilio(request):
                 session = Session(stream_sid, workspace_id, agent_uuid, call_sid)
                 SESSIONS[stream_sid] = session
                 session.config = await resolve_config(workspace_id, agent_uuid)
+                asyncio.create_task(session.warm_phrases())
                 blocked = str((session.config or {}).get("blocked_reason") or "")
                 greeting = session.agent().get("greeting") or ""
                 # Spoken as a task, never inline: the receive loop must stay free to
@@ -971,6 +1285,22 @@ async def ws_audio(request):
     return ws
 
 
+async def diag(request):
+    """One line's readiness, as booleans: no secret, no endpoint address, no audio."""
+    deps_ok, missing = await _deps_ready()
+    return web.json_response({
+        "ok": True,
+        "shop_id": request.query.get("shop_id") or "",
+        "uptime_s": int(time.time() - BOOTED),
+        "deps_ready": deps_ok,
+        "deps_missing": missing,
+        "sessions": len(SESSIONS),
+        "phrases_cached": len(PHRASE_AUDIO),
+        "policy": DEFAULT_POLICY,
+        "model": answer_model(),
+        "runtime": _runtime_pins(),
+    })
+
 def _build():
     app = web.Application(client_max_size=16 * 1024 * 1024)
     app.router.add_get("/health", health)
@@ -986,6 +1316,7 @@ def _build():
     app.router.add_get("/ws/audio", ws_audio)
     app.router.add_get("/ws", ws_audio)
     app.router.add_get("/twilio", ws_twilio)
+    app.router.add_get("/diag", diag)
     return app
 
 
